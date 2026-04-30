@@ -1,0 +1,3 @@
+../Core/Src/uart_utils.c:4:19:UART_SendBuffer	24	static
+../Core/Src/uart_utils.c:14:19:UART_SendString	24	static
+../Core/Src/uart_utils.c:27:19:UART_SendLine	24	static

@@ -1,0 +1,16 @@
+../Core/Src/ili9488.c:98:23:ILI9488_GetGlyph	16	static
+../Core/Src/ili9488.c:187:13:ILI9488_Select	8	static
+../Core/Src/ili9488.c:192:13:ILI9488_Unselect	8	static
+../Core/Src/ili9488.c:197:13:ILI9488_DC_Command	8	static
+../Core/Src/ili9488.c:202:13:ILI9488_DC_Data	8	static
+../Core/Src/ili9488.c:207:13:ILI9488_ResetHW	8	static
+../Core/Src/ili9488.c:215:13:ILI9488_WriteCommand	16	static
+../Core/Src/ili9488.c:223:13:ILI9488_WriteData	16	static
+../Core/Src/ili9488.c:231:13:ILI9488_SetAddressWindow	32	static
+../Core/Src/ili9488.c:252:13:ILI9488_WriteColor565	224	static
+../Core/Src/ili9488.c:288:6:ILI9488_Init	40	static
+../Core/Src/ili9488.c:388:6:ILI9488_FillRect	24	static
+../Core/Src/ili9488.c:409:6:ILI9488_FillScreen	24	static
+../Core/Src/ili9488.c:414:6:ILI9488_DrawChar	48	static
+../Core/Src/ili9488.c:442:6:ILI9488_DrawString	40	static
+../Core/Src/ili9488.c:452:6:ILI9488_DrawTextWrapped	48	static

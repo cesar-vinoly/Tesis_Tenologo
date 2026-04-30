@@ -1,0 +1,6 @@
+../Core/Src/uart_utils.c:14:6:UARTUTILS_Init	16	static
+../Core/Src/uart_utils.c:28:6:HAL_UART_RxCpltCallback	16	static
+../Core/Src/uart_utils.c:88:6:HAL_UART_ErrorCallback	16	static
+../Core/Src/uart_utils.c:112:6:UARTUTILS_Task	4	static
+../Core/Src/uart_utils.c:119:9:UARTUTILS_LineAvailable	4	static
+../Core/Src/uart_utils.c:124:6:UARTUTILS_GetLine	16	static,ignoring_inline_asm
