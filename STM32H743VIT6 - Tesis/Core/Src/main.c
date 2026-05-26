@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Main program body — Módulo Superficie STM32H743VIT6
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -13,15 +13,90 @@
 /* USER CODE BEGIN Includes */
 #include "uart_utils.h"
 #include "ili9488.h"
+#include <string.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef enum
+{
+    STATE_INICIO = 0,
+    STATE_ESTABLECER_CONEXION,
+    STATE_ERROR_CONEXION,
+    STATE_COMPROBACION_SISTEMA,
+    STATE_SISTEMA_OPERANDO,
+    STATE_INICIAR_MUESTREO,
+    STATE_MUESTREO_COMPLETO,
+    STATE_CONSULTA,
+    STATE_DESCARGA,
+    STATE_ARMADO
+} SystemState_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/* ---- Protocolo UART (strings terminados en \r\n) ----
+ *
+ *  Superficie ENVÍA        Sumergido RESPONDE
+ *  ------------------      --------------------------
+ *  PING\r\n           →    ACK\r\n
+ *  STATUS\r\n         →    VASTAGO:INIT\r\n  | VASTAGO:FINAL\r\n
+ *  CMD:MUESTREO\r\n   →    MUESTREO_OK\r\n  (confirmación inicio)
+ *                     →    MUESTREO_DONE\r\n (muestra realizada, asíncrono)
+ *  CMD:DESCARGA\r\n   →    DESCARGA_OK\r\n
+ *  CMD:ARMAR\r\n      →    ARMADO_OK\r\n
+ */
+#define CMD_PING              "PING\r\n"
+#define CMD_STATUS            "STATUS\r\n"
+#define CMD_INICIAR_MUESTREO  "CMD:MUESTREO\r\n"
+#define CMD_DESCARGA          "CMD:DESCARGA\r\n"
+#define CMD_ARMAR             "CMD:ARMAR\r\n"
+
+#define RSP_ACK               "ACK"
+#define RSP_VASTAGO_INIT      "VASTAGO:INIT"
+#define RSP_VASTAGO_FINAL     "VASTAGO:FINAL"
+#define RSP_MUESTREO_OK       "MUESTREO_OK"
+#define RSP_MUESTREO_DONE     "MUESTREO_DONE"
+#define RSP_DESCARGA_OK       "DESCARGA_OK"
+#define RSP_ARMADO_OK         "ARMADO_OK"
+
+/* ---- Tiempos (ms) ---- */
+#define TIMEOUT_CONEXION_MS    20000U  /* Tiempo máx. para establecer conexión */
+#define TIMEOUT_RESPUESTA_MS    3000U  /* Tiempo máx. esperando respuesta a cmd */
+#define INTERVALO_PING_MS       1000U  /* Período entre reintentos de PING      */
+#define TIMEOUT_MUESTREO_MS    60000U  /* Tiempo máx. para completar muestreo   */
+#define DEBOUNCE_MS               50U  /* Antirrebote de botones                */
+
+/* ---- GPIO: Botones (entradas — GPIOD) ----
+ *   PD8  → Acción principal (muestreo en SISTEMA_OPERANDO / descarga en CONSULTA)
+ *   PD9  → Confirmar armado (en CONSULTA)
+ *   PD10 → Cancelar (en DESCARGA)
+ *   PB15 → Reservado para uso futuro
+ */
+#define BTN_ACCION_PORT       GPIOD
+#define BTN_ACCION_PIN        GPIO_PIN_8
+#define BTN_CONFIRMAR_PORT    GPIOD
+#define BTN_CONFIRMAR_PIN     GPIO_PIN_9
+#define BTN_CANCELAR_PORT     GPIOD
+#define BTN_CANCELAR_PIN      GPIO_PIN_10
+
+/* ---- GPIO: Salidas (GPIOE) ----
+ *   PE11, PE12, PE13 están reservados por la librería ILI9488 (RST, DC, CS).
+ *   NO usar estos pines para otras salidas.
+ *   Si se necesitan LEDs indicadores, usar pines libres de otro puerto.
+ */
+
+/* ---- ADC3: Medición de batería ----
+ *   Canal 10, resolución 16 bits, modo continuo.
+ *   Ajustar BATT_FULL_RAW y BATT_EMPTY_RAW según el divisor resistivo real.
+ *   Por defecto se asume escala completa del ADC = batería llena.
+ */
+#define BATT_FULL_RAW         65535U
+#define BATT_EMPTY_RAW        20000U   /* ~3.3 V con divisor a ajustar */
 
 /* USER CODE END PD */
 
@@ -42,8 +117,24 @@ SPI_HandleTypeDef hspi1;
 UART_HandleTypeDef huart4;
 
 /* USER CODE BEGIN PV */
-static char g_uart_line[UARTUTILS_LINE_MAX];
+
+/* ---- Variables originales ---- */
+static char    g_uart_line[UARTUTILS_LINE_MAX];
 static uint8_t g_sd_available = 0U;
+
+/* ---- Estado de la máquina ---- */
+static SystemState_t g_estado        = STATE_INICIO;   /* Estado activo */
+static uint32_t      g_ts_conexion   = 0U;  /* Tick al entrar a ESTABLECER_CONEXION */
+static uint32_t      g_ts_ping       = 0U;  /* Tick del último PING enviado         */
+static uint32_t      g_ts_respuesta  = 0U;  /* Tick al enviar un comando            */
+static uint32_t      g_ts_muestreo   = 0U;  /* Tick al iniciar el muestreo          */
+static uint8_t       g_esperando_rsp = 0U;  /* 1 = comando enviado, esperando reply */
+static char          g_uart_rx[UARTUTILS_LINE_MAX]; /* Última línea UART recibida   */
+
+/* ---- Datos del sensor (actualizados en tiempo real) ---- */
+static char g_sensor_temp[16]  = "--.-";   /* Temperatura parseada, ej: "23.5" */
+static char g_sensor_depth[16] = "--.-";   /* Profundidad parseada, ej: "12.3" */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,29 +147,595 @@ static void MX_ADC3_Init(void);
 static void MX_SDMMC1_SD_Init(void);
 static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
+
 static uint8_t LineHasVisibleChars(const char *s);
+
+/* Máquina de estados */
+static void    SM_Run(void);
+static void    SM_SetState(SystemState_t nuevo);
+static void    SM_DrawScreen(void);
+
+/* Helpers */
+static void    SM_SendCmd(const char *cmd);
+static uint8_t SM_CheckResponse(const char *expected);
+static uint8_t SM_ButtonPressed(GPIO_TypeDef *port, uint16_t pin);
+static uint8_t SM_BatteryPercent(void);
+static uint8_t SM_ParseSensor(const char *line);
+static void    SM_UpdateSensorDisplay(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* --------------------------------------------------------------------------
+ * LineHasVisibleChars — función original del proyecto
+ * -------------------------------------------------------------------------- */
 static uint8_t LineHasVisibleChars(const char *s)
 {
-  if (s == NULL)
-  {
-    return 0U;
-  }
-
-  while (*s != '\0')
-  {
-    if ((*s >= 32) && (*s <= 126))
+    if (s == NULL) return 0U;
+    while (*s != '\0')
     {
-      return 1U;
+        if ((*s >= 32) && (*s <= 126)) return 1U;
+        s++;
     }
-    s++;
-  }
+    return 0U;
+}
 
-  return 0U;
+/* --------------------------------------------------------------------------
+ * SM_SendCmd
+ * Transmite un string de comando por UART4 hacia el módulo sumergido.
+ * -------------------------------------------------------------------------- */
+static void SM_SendCmd(const char *cmd)
+{
+    HAL_UART_Transmit(&huart4, (const uint8_t *)cmd, (uint16_t)strlen(cmd), 500U);
+}
+
+/* --------------------------------------------------------------------------
+ * SM_CheckResponse
+ * Devuelve 1 si g_uart_rx contiene la subcadena 'expected'.
+ * -------------------------------------------------------------------------- */
+static uint8_t SM_CheckResponse(const char *expected)
+{
+    return (strstr(g_uart_rx, expected) != NULL) ? 1U : 0U;
+}
+
+/* --------------------------------------------------------------------------
+ * SM_ButtonPressed
+ * Lectura de botón con antirrebote simple de DEBOUNCE_MS.
+ * Asume lógica directa (activo alto). Adaptar si los botones son activo bajo.
+ * -------------------------------------------------------------------------- */
+static uint8_t SM_ButtonPressed(GPIO_TypeDef *port, uint16_t pin)
+{
+    if (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_SET)
+    {
+        HAL_Delay(DEBOUNCE_MS);
+        return (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_SET) ? 1U : 0U;
+    }
+    return 0U;
+}
+
+/* --------------------------------------------------------------------------
+ * SM_BatteryPercent
+ * Lee el último valor del ADC3 (modo continuo, ya arrancado) y lo convierte
+ * a porcentaje (0–100). Ajustar BATT_FULL_RAW / BATT_EMPTY_RAW según
+ * el divisor resistivo del hardware real.
+ * -------------------------------------------------------------------------- */
+static uint8_t SM_BatteryPercent(void)
+{
+    uint32_t raw = HAL_ADC_GetValue(&hadc3);
+
+    if (raw >= BATT_FULL_RAW)  return 100U;
+    if (raw <= BATT_EMPTY_RAW) return 0U;
+
+    return (uint8_t)(((raw - BATT_EMPTY_RAW) * 100U) /
+                     (BATT_FULL_RAW - BATT_EMPTY_RAW));
+}
+
+/* --------------------------------------------------------------------------
+ * SM_ParseSensor
+ * Parsea una línea con formato: T=XX.XXD=XX.XX\r\n
+ *   - Temperatura: desde "T=" hasta "D="
+ *   - Profundidad: desde "D=" hasta \r, \n o fin de cadena
+ * Guarda los valores en g_sensor_temp y g_sensor_depth.
+ * Devuelve 1 si la línea era un dato de sensor válido, 0 si no.
+ * -------------------------------------------------------------------------- */
+static uint8_t SM_ParseSensor(const char *line)
+{
+    const char *p;
+    const char *end;
+    uint8_t     i;
+
+    if (line == NULL) return 0U;
+    if (strstr(line, "T=") == NULL) return 0U;
+
+    /* ---- Temperatura: desde T= hasta D= ---- */
+    p = strstr(line, "T=");
+    if (p != NULL)
+    {
+        p += 2U;                    /* Saltar "T="                  */
+        end = strstr(p, "D=");      /* El valor termina donde empieza D= */
+        if (end != NULL)
+        {
+            i = (uint8_t)(end - p);
+            if (i >= sizeof(g_sensor_temp)) i = (uint8_t)(sizeof(g_sensor_temp) - 1U);
+            strncpy(g_sensor_temp, p, i);
+            g_sensor_temp[i] = '\0';
+        }
+    }
+
+    /* ---- Profundidad: desde D= hasta \r, \n o fin ---- */
+    p = strstr(line, "D=");
+    if (p != NULL)
+    {
+        p += 2U;                    /* Saltar "D="                  */
+        end = p;
+        while (*end != '\0' && *end != '\r' && *end != '\n') end++;
+        i = (uint8_t)(end - p);
+        if (i >= sizeof(g_sensor_depth)) i = (uint8_t)(sizeof(g_sensor_depth) - 1U);
+        strncpy(g_sensor_depth, p, i);
+        g_sensor_depth[i] = '\0';
+    }
+
+    return 1U;
+}
+
+/* --------------------------------------------------------------------------
+ * SM_UpdateSensorDisplay
+ * Actualiza ÚNICAMENTE el área de datos del sensor en pantalla, sin
+ * redibujar el resto. Se llama cada vez que llega un dato nuevo.
+ *
+ * Layout fijo (solo válido en STATE_SISTEMA_OPERANDO):
+ *   Y=140  →  Fila temperatura   "Temp:  XX.X"
+ *   Y=185  →  Fila profundidad   "Prof:  XX.X"
+ * -------------------------------------------------------------------------- */
+static void SM_UpdateSensorDisplay(void)
+{
+    char buf[32];
+
+    /*
+     * Sin FillRect previo — el texto nuevo sobreescribe píxel a píxel
+     * el texto anterior gracias al fondo negro del DrawString.
+     * Para que el texto nuevo cubra siempre al anterior aunque sea más
+     * corto, se rellena con espacios hasta un ancho fijo de 20 chars.
+     */
+    snprintf(buf, sizeof(buf), "Temp: %-8s C  ", g_sensor_temp);
+    ILI9488_DrawString(18, 140, buf, ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
+
+    snprintf(buf, sizeof(buf), "Prof: %-8s m  ", g_sensor_depth);
+    ILI9488_DrawString(18, 185, buf, ILI9488_COLOR_CYAN,   ILI9488_COLOR_BLACK, 3);
+}
+
+/* --------------------------------------------------------------------------
+ * SM_DrawScreen
+ * Redibuja la pantalla ILI9488 completa según el estado activo.
+ * Se llama ÚNICAMENTE desde SM_SetState, es decir, solo cuando hay un
+ * cambio de estado. Así se evita redibujar en cada iteración del loop.
+ * -------------------------------------------------------------------------- */
+static void SM_DrawScreen(void)
+{
+    char buf[32];
+    uint8_t batt = SM_BatteryPercent();
+
+    ILI9488_FillScreen(ILI9488_COLOR_BLACK);
+
+    /* ---- Barra de estado superior: nivel de batería ---- */
+    snprintf(buf, sizeof(buf), "Bat: %d%%", (int)batt);
+    ILI9488_DrawString(ILI9488_WIDTH - 130, 6,
+                       buf, ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
+
+    /* ---- Contenido según estado ---- */
+    switch (g_estado)
+    {
+    /* ------------------------------------------------------------------ */
+    case STATE_INICIO:
+        ILI9488_DrawString(18, 60,
+            "Iniciando...",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 3);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_ESTABLECER_CONEXION:
+        ILI9488_DrawString(18, 40,
+            "Conectando",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
+        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
+            "Buscando modulo sumergido...",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+        ILI9488_DrawTextWrapped(18, 200, ILI9488_WIDTH - 36,
+            "Reintentando cada 1 s (max 20 s)",
+            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_ERROR_CONEXION:
+        ILI9488_FillScreen(ILI9488_COLOR_RED);
+        ILI9488_DrawString(18, 40,
+            "ERROR",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_RED, 4);
+        ILI9488_DrawTextWrapped(18, 120, ILI9488_WIDTH - 36,
+            "Sin conexion con modulo sumergido.",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_RED, 2);
+        ILI9488_DrawTextWrapped(18, 200, ILI9488_WIDTH - 36,
+            "Resetee el equipo para reintentar.",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_COMPROBACION_SISTEMA:
+        ILI9488_DrawString(18, 40,
+            "Verificando",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
+        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
+            "Consultando posicion del vastago...",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_SISTEMA_OPERANDO:
+        ILI9488_DrawString(18, 40,
+            "Sistema OK",
+            ILI9488_COLOR_GREEN, ILI9488_COLOR_BLACK, 3);
+        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
+            "Vastago en posicion inicial.",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+        /* Área Y=130..230 reservada para datos del sensor (SM_UpdateSensorDisplay) */
+        SM_UpdateSensorDisplay();
+        ILI9488_DrawTextWrapped(18, 245, ILI9488_WIDTH - 36,
+            "[PD8] Iniciar muestreo",
+            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_INICIAR_MUESTREO:
+        ILI9488_DrawString(18, 40,
+            "Muestreo",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
+        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
+            "Muestra en proceso...",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+        ILI9488_DrawTextWrapped(18, 160, ILI9488_WIDTH - 36,
+            "Esperando confirmacion del sumergido.",
+            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_MUESTREO_COMPLETO:
+        ILI9488_DrawString(18, 40,
+            "Completado",
+            ILI9488_COLOR_GREEN, ILI9488_COLOR_BLACK, 3);
+        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
+            "Muestra realizada correctamente.",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_CONSULTA:
+        ILI9488_DrawString(18, 40,
+            "Consulta",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
+        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
+            "Vastago en posicion final.",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+        ILI9488_DrawTextWrapped(18, 160, ILI9488_WIDTH - 36,
+            "[PD8]  Confirmar descarga",
+            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
+        ILI9488_DrawTextWrapped(18, 210, ILI9488_WIDTH - 36,
+            "[PD9]  Confirmar armado",
+            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_DESCARGA:
+        ILI9488_DrawString(18, 40,
+            "Descarga",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
+        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
+            "Descarga y limpieza en curso...",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+        ILI9488_DrawTextWrapped(18, 210, ILI9488_WIDTH - 36,
+            "[PD10] Cancelar descarga",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_ARMADO:
+        ILI9488_DrawString(18, 40,
+            "Armando",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
+        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
+            "Preparando sistema para siguiente toma...",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * SM_SetState
+ * Cambia el estado activo, resetea flags compartidos y redibuja la pantalla.
+ * Es el único punto de transición entre estados.
+ * -------------------------------------------------------------------------- */
+static void SM_SetState(SystemState_t nuevo)
+{
+    g_estado        = nuevo;
+    g_esperando_rsp = 0U;
+    g_uart_rx[0]    = '\0';
+
+    /* Pantalla */
+    SM_DrawScreen();
+}
+
+/* --------------------------------------------------------------------------
+ * SM_Run
+ * Ejecuta un tick de la máquina de estados. Debe llamarse en cada
+ * iteración del while(1), DESPUÉS de UARTUTILS_Task().
+ * -------------------------------------------------------------------------- */
+static void SM_Run(void)
+{
+    uint32_t ahora    = HAL_GetTick();
+    uint8_t  hay_linea = 0U;
+
+    /* ---- Capturar línea UART si está disponible ---- */
+    if (UARTUTILS_LineAvailable())
+    {
+        UARTUTILS_GetLine(g_uart_line, sizeof(g_uart_line));
+        if (LineHasVisibleChars(g_uart_line))
+        {
+            /* ¿Es un dato del sensor? Parsearlo y actualizar pantalla */
+            if (SM_ParseSensor(g_uart_line))
+            {
+                if (g_estado == STATE_SISTEMA_OPERANDO)
+                {
+                    SM_UpdateSensorDisplay();
+                }
+                /* No es un comando de protocolo: no activar hay_linea */
+            }
+            else
+            {
+                strncpy(g_uart_rx, g_uart_line, sizeof(g_uart_rx) - 1U);
+                g_uart_rx[sizeof(g_uart_rx) - 1U] = '\0';
+                hay_linea = 1U;
+            }
+        }
+    }
+
+    /* ---- Lógica de cada estado ---- */
+    switch (g_estado)
+    {
+
+    /* ================================================================== */
+    case STATE_INICIO:
+    /*
+     * Inicializa timestamps y transiciona inmediatamente.
+     * La pantalla "Iniciando..." se muestra sólo un instante.
+     */
+        g_ts_conexion   = ahora;
+        g_ts_ping       = 0U;
+        g_esperando_rsp = 0U;
+        g_uart_rx[0]    = '\0';
+        SM_SetState(STATE_ESTABLECER_CONEXION);
+        break;
+
+    /* ================================================================== */
+    case STATE_ESTABLECER_CONEXION:
+    /*
+     * Envía PING cada INTERVALO_PING_MS.
+     * Si recibe ACK → COMPROBACION_SISTEMA.
+     * Si pasan TIMEOUT_CONEXION_MS sin ACK → ERROR_CONEXION.
+     */
+        /* ¿Tiempo agotado? */
+        if ((ahora - g_ts_conexion) >= TIMEOUT_CONEXION_MS)
+        {
+            SM_SetState(STATE_ERROR_CONEXION);
+            break;
+        }
+
+        /* ¿Llegó ACK? */
+        if (hay_linea && SM_CheckResponse(RSP_ACK))
+        {
+            SM_SetState(STATE_COMPROBACION_SISTEMA);
+            break;
+        }
+
+        /* ¿Hay que enviar (o reenviar) PING? */
+        if (!g_esperando_rsp || (ahora - g_ts_ping) >= INTERVALO_PING_MS)
+        {
+            SM_SendCmd(CMD_PING);
+            g_ts_ping       = ahora;
+            g_esperando_rsp = 1U;
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_ERROR_CONEXION:
+    /*
+     * Estado terminal. No hace nada; la pantalla ya muestra el error
+     * y el LED_ERROR está encendido. El operador debe resetear el equipo.
+     */
+        break;
+
+    /* ================================================================== */
+    case STATE_COMPROBACION_SISTEMA:
+    /*
+     * Solicita STATUS al sumergido.
+     * VASTAGO:INIT  → SISTEMA_OPERANDO
+     * VASTAGO:FINAL → CONSULTA
+     * Sin respuesta en TIMEOUT_RESPUESTA_MS → reenvía STATUS.
+     */
+        if (!g_esperando_rsp)
+        {
+            SM_SendCmd(CMD_STATUS);
+            g_ts_respuesta  = ahora;
+            g_esperando_rsp = 1U;
+            break;
+        }
+
+        if ((ahora - g_ts_respuesta) >= TIMEOUT_RESPUESTA_MS)
+        {
+            g_esperando_rsp = 0U;   /* Forzar reenvío en próxima iteración */
+            break;
+        }
+
+        if (hay_linea)
+        {
+            if (SM_CheckResponse(RSP_VASTAGO_INIT))
+            {
+                SM_SetState(STATE_SISTEMA_OPERANDO);
+            }
+            else if (SM_CheckResponse(RSP_VASTAGO_FINAL))
+            {
+                SM_SetState(STATE_CONSULTA);
+            }
+            else
+            {
+                /* Respuesta inesperada: descartar y reenviar */
+                g_uart_rx[0]    = '\0';
+                g_esperando_rsp = 0U;
+            }
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_SISTEMA_OPERANDO:
+    /*
+     * El vástago está en posición inicial.
+     * El operador pulsa PD8 para iniciar el muestreo.
+     */
+        if (SM_ButtonPressed(BTN_ACCION_PORT, BTN_ACCION_PIN))
+        {
+            SM_SetState(STATE_INICIAR_MUESTREO);
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_INICIAR_MUESTREO:
+    /*
+     * Envía CMD:MUESTREO al sumergido.
+     * Espera MUESTREO_DONE (puede llegar después de MUESTREO_OK).
+     * Si pasan TIMEOUT_MUESTREO_MS sin DONE → vuelve a COMPROBACION.
+     */
+        if (!g_esperando_rsp)
+        {
+            SM_SendCmd(CMD_INICIAR_MUESTREO);
+            g_ts_respuesta  = ahora;
+            g_ts_muestreo   = ahora;
+            g_esperando_rsp = 1U;
+            break;
+        }
+
+        /* Timeout global del proceso de muestreo */
+        if ((ahora - g_ts_muestreo) >= TIMEOUT_MUESTREO_MS)
+        {
+            SM_SetState(STATE_COMPROBACION_SISTEMA);
+            break;
+        }
+
+        if (hay_linea)
+        {
+            if (SM_CheckResponse(RSP_MUESTREO_DONE))
+            {
+                SM_SetState(STATE_MUESTREO_COMPLETO);
+            }
+            else
+            {
+                /* MUESTREO_OK u otro: seguir esperando DONE */
+                g_uart_rx[0] = '\0';
+            }
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_MUESTREO_COMPLETO:
+    /*
+     * Muestra el resultado brevemente y regresa a COMPROBACION.
+     */
+        HAL_Delay(1500U);
+        SM_SetState(STATE_COMPROBACION_SISTEMA);
+        break;
+
+    /* ================================================================== */
+    case STATE_CONSULTA:
+    /*
+     * El vástago está en posición final. El operador elige:
+     *   PD8  → descarga
+     *   PD9  → armado directo
+     */
+        if (SM_ButtonPressed(BTN_ACCION_PORT, BTN_ACCION_PIN))
+        {
+            SM_SetState(STATE_DESCARGA);
+        }
+        else if (SM_ButtonPressed(BTN_CONFIRMAR_PORT, BTN_CONFIRMAR_PIN))
+        {
+            SM_SetState(STATE_ARMADO);
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_DESCARGA:
+    /*
+     * Envía CMD:DESCARGA. Cuando recibe DESCARGA_OK → ARMADO.
+     * PD10 cancela la descarga y vuelve a CONSULTA.
+     */
+        if (!g_esperando_rsp)
+        {
+            SM_SendCmd(CMD_DESCARGA);
+            g_ts_respuesta  = ahora;
+            g_esperando_rsp = 1U;
+            break;
+        }
+
+        if ((ahora - g_ts_respuesta) >= TIMEOUT_RESPUESTA_MS)
+        {
+            g_esperando_rsp = 0U;   /* Reenviar */
+            break;
+        }
+
+        if (hay_linea && SM_CheckResponse(RSP_DESCARGA_OK))
+        {
+            SM_SetState(STATE_ARMADO);
+            break;
+        }
+
+        /* Cancelación manual */
+        if (SM_ButtonPressed(BTN_CANCELAR_PORT, BTN_CANCELAR_PIN))
+        {
+            SM_SetState(STATE_CONSULTA);
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_ARMADO:
+    /*
+     * Envía CMD:ARMAR. Cuando recibe ARMADO_OK → COMPROBACION_SISTEMA.
+     */
+        if (!g_esperando_rsp)
+        {
+            SM_SendCmd(CMD_ARMAR);
+            g_ts_respuesta  = ahora;
+            g_esperando_rsp = 1U;
+            break;
+        }
+
+        if ((ahora - g_ts_respuesta) >= TIMEOUT_RESPUESTA_MS)
+        {
+            g_esperando_rsp = 0U;   /* Reenviar */
+            break;
+        }
+
+        if (hay_linea && SM_CheckResponse(RSP_ARMADO_OK))
+        {
+            SM_SetState(STATE_COMPROBACION_SISTEMA);
+        }
+        break;
+
+    /* ================================================================== */
+    default:
+        SM_SetState(STATE_INICIO);
+        break;
+    }
 }
 
 /* USER CODE END 0 */
@@ -122,44 +779,30 @@ int main(void)
   g_sd_available = (HAL_SD_GetState(&hsd1) == HAL_SD_STATE_READY) ? 1U : 0U;
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+
+  /* Pantalla */
   ILI9488_Init(&hspi1);
 
-  ILI9488_FillScreen(ILI9488_COLOR_BLUE);
-  ILI9488_DrawTextWrapped(18, 40, ILI9488_WIDTH - 36,
-                          "Esperando mensaje por UART4",
-                          ILI9488_COLOR_WHITE, ILI9488_COLOR_BLUE, 3);
-
+  /* UART hacia módulo sumergido */
   UARTUTILS_Init(&huart4);
+
+  /* ADC batería: arrancar en modo continuo (configurado en MX_ADC3_Init) */
+  HAL_ADC_Start(&hadc3);
+
+  /* Pantalla inicial antes de entrar al loop */
+  SM_DrawScreen();   /* Muestra STATE_INICIO ("Iniciando...") */
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* Procesar bytes UART entrantes (debe llamarse en cada iteración) */
     UARTUTILS_Task();
 
-    if (UARTUTILS_LineAvailable())
-    {
-      UARTUTILS_GetLine(g_uart_line, sizeof(g_uart_line));
-
-      /* Si la línea vino vacía o sin caracteres imprimibles, no tocar la pantalla */
-      if (!LineHasVisibleChars(g_uart_line))
-      {
-        continue;
-      }
-
-      ILI9488_FillScreen(ILI9488_COLOR_BLACK);
-      ILI9488_DrawString(12, 18, "UART4:", ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 3);
-
-      /* Dibujamos entre corchetes para verificar visualmente qué llegó */
-      ILI9488_DrawString(12, 60, "[", ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 3);
-
-      ILI9488_DrawTextWrapped(30, 60, ILI9488_WIDTH - 60,
-                              g_uart_line,
-                              ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
-
-      ILI9488_DrawString(ILI9488_WIDTH - 30, 60, "]", ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 3);
-    }
+    /* Ejecutar un tick de la máquina de estados */
+    SM_Run();
 
     /* USER CODE END WHILE */
 
@@ -281,6 +924,7 @@ static void MX_ADC3_Init(void)
   {
     Error_Handler();
   }
+
   /* USER CODE BEGIN ADC3_Init 2 */
 
   /* USER CODE END ADC3_Init 2 */

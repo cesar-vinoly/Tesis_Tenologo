@@ -303,8 +303,8 @@ void ILI9488_Init(SPI_HandleTypeDef *hspi)
     static const uint8_t power2[] = {0x41};
     static const uint8_t vcom[]   = {0x00, 0x12, 0x80};
 
-    /* Orientación horizontal */
-    static const uint8_t madctl[] = {0xE8};
+    /* Orientación horizontal: valosres {0xE8}, {0x28}*/
+    static const uint8_t madctl[] = {0x28};
 
     /* ILI9488 en modo RGB666, 18 bits por pixel */
     static const uint8_t pixfmt[] = {0x66};
