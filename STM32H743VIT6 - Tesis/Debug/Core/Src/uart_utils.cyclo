@@ -1,6 +1,6 @@
-../Core/Src/uart_utils.c:14:6:UARTUTILS_Init	1
-../Core/Src/uart_utils.c:28:6:HAL_UART_RxCpltCallback	9
-../Core/Src/uart_utils.c:88:6:HAL_UART_ErrorCallback	3
-../Core/Src/uart_utils.c:112:6:UARTUTILS_Task	1
-../Core/Src/uart_utils.c:119:9:UARTUTILS_LineAvailable	1
-../Core/Src/uart_utils.c:124:6:UARTUTILS_GetLine	3
+../Core/Src/uart_utils.c:21:6:UARTUTILS_Init	2
+../Core/Src/uart_utils.c:40:6:HAL_UART_RxCpltCallback	11
+../Core/Src/uart_utils.c:99:6:HAL_UART_ErrorCallback	4
+../Core/Src/uart_utils.c:118:6:UARTUTILS_Task	1
+../Core/Src/uart_utils.c:123:9:UARTUTILS_LineAvailable	2
+../Core/Src/uart_utils.c:128:6:UARTUTILS_GetLine	4

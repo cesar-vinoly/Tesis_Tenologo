@@ -13,6 +13,15 @@
 
 static SPI_HandleTypeDef *s_hspi = NULL;
 
+/* Buffers reutilizables. Evitan miles de transacciones pequeñas al rellenar
+ * áreas o dibujar texto. La aplicación no dibuja desde interrupciones, por lo
+ * que pueden compartirse de forma segura. */
+#define ILI9488_COLOR_CHUNK_PIXELS 2048U
+#define ILI9488_MAX_FONT_SCALE        4U
+static uint8_t s_color_buffer[ILI9488_COLOR_CHUNK_PIXELS * 3U];
+static uint8_t s_char_buffer[(6U * ILI9488_MAX_FONT_SCALE) *
+                             (7U * ILI9488_MAX_FONT_SCALE) * 3U];
+
 /* -------------------- Fuente 5x7 -------------------- */
 /* Cada fila usa 5 bits. Bit 4 = pixel izquierdo */
 
@@ -29,6 +38,9 @@ static const uint8_t g_plus[7]  = {0x00,0x04,0x04,0x1F,0x04,0x04,0x00};
 static const uint8_t g_equal[7] = {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00};
 static const uint8_t g_lpar[7]  = {0x02,0x04,0x08,0x08,0x08,0x04,0x02};
 static const uint8_t g_rpar[7]  = {0x08,0x04,0x02,0x02,0x02,0x04,0x08};
+static const uint8_t g_lbracket[7] = {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E};
+static const uint8_t g_rbracket[7] = {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E};
+static const uint8_t g_percent[7] = {0x18,0x19,0x02,0x04,0x08,0x13,0x03};
 
 static const uint8_t g_0[7] = {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E};
 static const uint8_t g_1[7] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E};
@@ -112,6 +124,9 @@ static const uint8_t* ILI9488_GetGlyph(char c)
         case '=': return g_equal;
         case '(': return g_lpar;
         case ')': return g_rpar;
+        case '[': return g_lbracket;
+        case ']': return g_rbracket;
+        case '%': return g_percent;
 
         case '0': return g_0;
         case '1': return g_1;
@@ -249,25 +264,29 @@ static void ILI9488_SetAddressWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint
     ILI9488_WriteCommand(ILI9488_RAMWR);
 }
 
+static void ILI9488_Color565To666(uint16_t color, uint8_t rgb[3])
+{
+    uint8_t r5 = (uint8_t)((color >> 11) & 0x1FU);
+    uint8_t g6 = (uint8_t)((color >> 5)  & 0x3FU);
+    uint8_t b5 = (uint8_t)( color        & 0x1FU);
+
+    rgb[0] = (uint8_t)(((uint16_t)r5 * 255U / 31U) & 0xFCU);
+    rgb[1] = (uint8_t)(((uint16_t)g6 * 255U / 63U) & 0xFCU);
+    rgb[2] = (uint8_t)(((uint16_t)b5 * 255U / 31U) & 0xFCU);
+}
+
 static void ILI9488_WriteColor565(uint16_t color, uint32_t pixels)
 {
-    uint8_t r5 = (uint8_t)((color >> 11) & 0x1F);
-    uint8_t g6 = (uint8_t)((color >> 5)  & 0x3F);
-    uint8_t b5 = (uint8_t)( color        & 0x1F);
-
     uint8_t pixel[3];
-    uint8_t buffer[192];
     uint32_t i;
 
-    pixel[0] = (uint8_t)(((uint16_t)r5 * 255U / 31U) & 0xFCU);
-    pixel[1] = (uint8_t)(((uint16_t)g6 * 255U / 63U) & 0xFCU);
-    pixel[2] = (uint8_t)(((uint16_t)b5 * 255U / 31U) & 0xFCU);
+    ILI9488_Color565To666(color, pixel);
 
-    for (i = 0; i < sizeof(buffer); i += 3U)
+    for (i = 0; i < sizeof(s_color_buffer); i += 3U)
     {
-        buffer[i]     = pixel[0];
-        buffer[i + 1] = pixel[1];
-        buffer[i + 2] = pixel[2];
+        s_color_buffer[i]     = pixel[0];
+        s_color_buffer[i + 1] = pixel[1];
+        s_color_buffer[i + 2] = pixel[2];
     }
 
     ILI9488_Select();
@@ -275,8 +294,10 @@ static void ILI9488_WriteColor565(uint16_t color, uint32_t pixels)
 
     while (pixels > 0U)
     {
-        uint32_t chunk = (pixels > 64U) ? 64U : pixels;
-        HAL_SPI_Transmit(s_hspi, buffer, (uint16_t)(chunk * 3U), HAL_MAX_DELAY);
+        uint32_t chunk = (pixels > ILI9488_COLOR_CHUNK_PIXELS)
+                       ? ILI9488_COLOR_CHUNK_PIXELS : pixels;
+        HAL_SPI_Transmit(s_hspi, s_color_buffer,
+                         (uint16_t)(chunk * 3U), HAL_MAX_DELAY);
         pixels -= chunk;
     }
 
@@ -414,29 +435,82 @@ void ILI9488_FillScreen(uint16_t color)
 void ILI9488_DrawChar(uint16_t x, uint16_t y, char c, uint16_t color, uint16_t bg, uint8_t scale)
 {
     const uint8_t *glyph;
-    uint8_t row, col;
+    uint8_t fg_rgb[3];
+    uint8_t bg_rgb[3];
+    uint16_t cell_w;
+    uint16_t cell_h;
+    uint16_t draw_w;
+    uint16_t draw_h;
+    uint16_t px;
+    uint16_t py;
+    uint32_t index = 0U;
 
     glyph = ILI9488_GetGlyph(c);
 
-    for (row = 0; row < 7U; row++)
+    if ((scale == 0U) || (x >= ILI9488_WIDTH) || (y >= ILI9488_HEIGHT))
     {
-        for (col = 0; col < 5U; col++)
-        {
-            uint16_t px = x + (uint16_t)(col * scale);
-            uint16_t py = y + (uint16_t)(row * scale);
+        return;
+    }
 
-            if (glyph[row] & (1U << (4U - col)))
+    /* Mantener compatibilidad para escalas no usadas por esta aplicación. */
+    if (scale > ILI9488_MAX_FONT_SCALE)
+    {
+        uint8_t row;
+        uint8_t col;
+
+        for (row = 0U; row < 7U; row++)
+        {
+            for (col = 0U; col < 5U; col++)
             {
-                ILI9488_FillRect(px, py, scale, scale, color);
+                ILI9488_FillRect(x + (uint16_t)(col * scale),
+                                 y + (uint16_t)(row * scale),
+                                 scale, scale,
+                                 (glyph[row] & (1U << (4U - col)))
+                                     ? color : bg);
             }
-            else
+        }
+
+        ILI9488_FillRect(x + (uint16_t)(5U * scale), y, scale,
+                         (uint16_t)(7U * scale), bg);
+        return;
+    }
+
+    cell_w = (uint16_t)(6U * scale);
+    cell_h = (uint16_t)(7U * scale);
+    draw_w = ((x + cell_w) > ILI9488_WIDTH)  ? (ILI9488_WIDTH  - x) : cell_w;
+    draw_h = ((y + cell_h) > ILI9488_HEIGHT) ? (ILI9488_HEIGHT - y) : cell_h;
+
+    ILI9488_Color565To666(color, fg_rgb);
+    ILI9488_Color565To666(bg, bg_rgb);
+
+    for (py = 0U; py < draw_h; py++)
+    {
+        uint8_t glyph_row = (uint8_t)(py / scale);
+
+        for (px = 0U; px < draw_w; px++)
+        {
+            uint8_t glyph_col = (uint8_t)(px / scale);
+            const uint8_t *rgb = bg_rgb;
+
+            if ((glyph_col < 5U) &&
+                ((glyph[glyph_row] & (1U << (4U - glyph_col))) != 0U))
             {
-                ILI9488_FillRect(px, py, scale, scale, bg);
+                rgb = fg_rgb;
             }
+
+            s_char_buffer[index++] = rgb[0];
+            s_char_buffer[index++] = rgb[1];
+            s_char_buffer[index++] = rgb[2];
         }
     }
 
-    ILI9488_FillRect(x + (uint16_t)(5U * scale), y, scale, (uint16_t)(7U * scale), bg);
+    ILI9488_SetAddressWindow(x, y,
+                             x + draw_w - 1U,
+                             y + draw_h - 1U);
+    ILI9488_Select();
+    ILI9488_DC_Data();
+    HAL_SPI_Transmit(s_hspi, s_char_buffer, (uint16_t)index, HAL_MAX_DELAY);
+    ILI9488_Unselect();
 }
 
 void ILI9488_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg, uint8_t scale)
