@@ -52,6 +52,15 @@ typedef enum
     SD_LOG_ERROR
 } SdLogStatus_t;
 
+/* Texto ya dibujado en pantalla. Permite actualizar únicamente los
+ * caracteres que cambian, sin borrar previamente todo el renglón. */
+typedef struct
+{
+    char     text[24];
+    uint16_t color;
+    uint8_t  valid;
+} DisplayTextCache_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -273,6 +282,17 @@ static char g_ultimo_muestreo_ts[24] = "";
 static char g_sample_date[11] = "--/--/----";
 static char g_sample_time[6]  = "--:--";
 
+/* ---- Caché de renderizado para evitar parpadeos ---- */
+static DisplayTextCache_t g_draw_depth;
+static DisplayTextCache_t g_draw_temp;
+static DisplayTextCache_t g_draw_motor;
+static DisplayTextCache_t g_draw_valve;
+static DisplayTextCache_t g_draw_comm;
+static DisplayTextCache_t g_draw_clock;
+static DisplayTextCache_t g_draw_battery;
+static DisplayTextCache_t g_draw_menu[MENU_TOTAL];
+static uint8_t g_draw_sensor_sample_layout = 0xFFU;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -302,10 +322,18 @@ static uint8_t SM_ButtonPressed(GPIO_TypeDef *port, uint16_t pin);
 static uint8_t SM_ButtonEdge(GPIO_TypeDef *port, uint16_t pin, uint8_t *prev);
 static uint8_t SM_BatteryPercent(void);
 static uint8_t SM_ParseSensor(const char *line);
+static void    SM_DrawCachedText(uint16_t x, uint16_t y, const char *text,
+                                 uint16_t color, uint8_t scale,
+                                 DisplayTextCache_t *cache);
+static void    SM_InvalidateDashboardBodyCache(void);
+static void    SM_InvalidateDashboardCache(void);
 static void    SM_UpdateSensorDisplay(void);
 static uint8_t SM_IsDashboardState(SystemState_t state);
 static void    SM_DrawDashboard(uint8_t batt);
+static void    SM_DrawDashboardBody(void);
+static void    SM_ClearDashboardLayout(uint8_t sample_layout);
 static void    SM_UpdateDashboardClock(void);
+static void    SM_UpdateDashboardBattery(uint8_t batt);
 static void    SM_UpdateDashboardStatus(void);
 static void    SM_UpdateMenuDisplay(void);
 static void    SM_HandleMenu(void);
@@ -813,6 +841,113 @@ static uint8_t SM_IsDashboardState(SystemState_t state)
             (state == STATE_ARMADO)) ? 1U : 0U;
 }
 
+/* Dibuja el texto completo la primera vez. En actualizaciones posteriores
+ * transmite solamente las celdas de caracteres cuyo contenido cambió. Como
+ * cada celda incluye su fondo negro, no hace falta borrar antes y desaparece
+ * el destello producido por la secuencia borrar-dibujar. */
+static void SM_DrawCachedText(uint16_t x, uint16_t y, const char *text,
+                              uint16_t color, uint8_t scale,
+                              DisplayTextCache_t *cache)
+{
+    size_t new_len;
+    size_t old_len;
+    size_t i;
+    char cell[2] = {'\0', '\0'};
+
+    if ((text == NULL) || (cache == NULL) || (scale == 0U))
+    {
+        return;
+    }
+
+    new_len = strlen(text);
+    old_len = cache->valid ? strlen(cache->text) : 0U;
+
+    if (!cache->valid || (cache->color != color) || (old_len != new_len))
+    {
+        if (cache->valid && (old_len != new_len))
+        {
+            size_t clear_len = (old_len > new_len) ? old_len : new_len;
+            ILI9488_FillRect(x, y,
+                             (uint16_t)(clear_len * 6U * scale),
+                             (uint16_t)(7U * scale),
+                             ILI9488_COLOR_BLACK);
+        }
+
+        ILI9488_DrawString(x, y, text, color, ILI9488_COLOR_BLACK, scale);
+    }
+    else
+    {
+        for (i = 0U; i < new_len; i++)
+        {
+            if (cache->text[i] != text[i])
+            {
+                cell[0] = text[i];
+                ILI9488_DrawString((uint16_t)(x + (i * 6U * scale)), y,
+                                   cell, color, ILI9488_COLOR_BLACK, scale);
+            }
+        }
+    }
+
+    strncpy(cache->text, text, sizeof(cache->text) - 1U);
+    cache->text[sizeof(cache->text) - 1U] = '\0';
+    cache->color = color;
+    cache->valid = 1U;
+}
+
+static void SM_InvalidateDashboardBodyCache(void)
+{
+    g_draw_depth.valid = 0U;
+    g_draw_temp.valid  = 0U;
+    g_draw_motor.valid = 0U;
+    g_draw_valve.valid = 0U;
+    g_draw_comm.valid  = 0U;
+    g_draw_sensor_sample_layout = 0xFFU;
+}
+
+static void SM_InvalidateDashboardCache(void)
+{
+    uint8_t i;
+
+    SM_InvalidateDashboardBodyCache();
+    g_draw_clock.valid   = 0U;
+    g_draw_battery.valid = 0U;
+
+    for (i = 0U; i < (uint8_t)MENU_TOTAL; i++)
+    {
+        g_draw_menu[i].valid = 0U;
+    }
+}
+
+/* Borra exclusivamente los textos pertenecientes a la distribución anterior.
+ * Es mucho más rápido que transferir nuevamente los 153600 píxeles del panel
+ * completo y mantiene intactos el encabezado y el menú inferior. */
+static void SM_ClearDashboardLayout(uint8_t sample_layout)
+{
+    uint8_t i;
+
+    if (sample_layout)
+    {
+        ILI9488_FillRect(130U,  58U, 220U, 20U, ILI9488_COLOR_BLACK);
+        ILI9488_FillRect(170U,  94U, 140U, 20U, ILI9488_COLOR_BLACK);
+        ILI9488_FillRect(200U, 124U,  80U, 20U, ILI9488_COLOR_BLACK);
+        ILI9488_FillRect( 80U, 168U, 330U, 20U, ILI9488_COLOR_BLACK);
+        ILI9488_FillRect(105U, 214U, 310U, 20U, ILI9488_COLOR_BLACK);
+        ILI9488_FillRect(105U, 244U, 310U, 20U, ILI9488_COLOR_BLACK);
+    }
+    else
+    {
+        static const uint16_t row_y[5] = {88U, 118U, 148U, 178U, 208U};
+
+        for (i = 0U; i < 5U; i++)
+        {
+            ILI9488_FillRect(12U, row_y[i], 150U, 18U,
+                             ILI9488_COLOR_BLACK);
+            ILI9488_FillRect(244U, row_y[i], 145U, 18U,
+                             ILI9488_COLOR_BLACK);
+        }
+    }
+}
+
 static void SM_UpdateSensorDisplay(void)
 {
     const char *temperature;
@@ -820,14 +955,18 @@ static void SM_UpdateSensorDisplay(void)
     uint16_t value_x;
     uint16_t depth_y;
     uint16_t temp_y;
-    char buf[24];
+    char depth_text[16];
+    char temp_text[16];
+    uint8_t sample_layout;
 
     if (!SM_IsDashboardState(g_estado))
     {
         return;
     }
 
-    if (g_menu_post_sample && g_sample_available)
+    sample_layout = (g_menu_post_sample && g_sample_available) ? 1U : 0U;
+
+    if (sample_layout)
     {
         temperature = g_sample_temp;
         depth       = g_sample_depth;
@@ -844,27 +983,30 @@ static void SM_UpdateSensorDisplay(void)
         temp_y  = 118U;
     }
 
-    /* Se limpian solo los valores; las etiquetas y el resto de la pantalla
-     * permanecen intactos durante cada actualizacion del sensor. */
-    ILI9488_FillRect(value_x, depth_y, ILI9488_WIDTH - value_x, 18U,
-                     ILI9488_COLOR_BLACK);
-    snprintf(buf, sizeof(buf), "%.8s m", depth);
-    ILI9488_DrawString(value_x, depth_y, buf,
-                       ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+    if (g_draw_sensor_sample_layout != sample_layout)
+    {
+        g_draw_depth.valid = 0U;
+        g_draw_temp.valid  = 0U;
+        g_draw_sensor_sample_layout = sample_layout;
+    }
 
-    ILI9488_FillRect(value_x, temp_y, ILI9488_WIDTH - value_x, 18U,
-                     ILI9488_COLOR_BLACK);
-    /* Se usa C en lugar del caracter de grado para evitar que una fuente que
-     * no lo contenga muestre un signo de interrogacion. */
-    snprintf(buf, sizeof(buf), "%.8s C", temperature);
-    ILI9488_DrawString(value_x, temp_y, buf,
-                       ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
+    /* Cadenas de ancho fijo: los espacios finales reemplazan cualquier cifra
+     * anterior sin limpiar el renglón completo. */
+    snprintf(depth_text, sizeof(depth_text), "%-8.8s m", depth);
+    snprintf(temp_text, sizeof(temp_text), "%-8.8s C", temperature);
+
+    SM_DrawCachedText(value_x, depth_y, depth_text,
+                      ILI9488_COLOR_WHITE, 2U, &g_draw_depth);
+    SM_DrawCachedText(value_x, temp_y, temp_text,
+                      ILI9488_COLOR_WHITE, 2U, &g_draw_temp);
 }
 
 static void SM_UpdateDashboardStatus(void)
 {
     const char *motor_text;
     uint8_t motor_activo;
+    char motor_fixed[12];
+    char valve_fixed[12];
 
     if (!SM_IsDashboardState(g_estado) ||
         (g_menu_post_sample && g_sample_available))
@@ -894,36 +1036,31 @@ static void SM_UpdateDashboardStatus(void)
         motor_activo = 0U;
     }
 
-    ILI9488_FillRect(DASH_VALUE_X, 148U,
-                     ILI9488_WIDTH - DASH_VALUE_X, 18U,
-                     ILI9488_COLOR_BLACK);
-    ILI9488_DrawString(DASH_VALUE_X, 148U, motor_text,
-        motor_activo ? ILI9488_COLOR_GREEN : ILI9488_COLOR_WHITE,
-        ILI9488_COLOR_BLACK, 2);
+    snprintf(motor_fixed, sizeof(motor_fixed), "%-9.9s", motor_text);
+    snprintf(valve_fixed, sizeof(valve_fixed), "%-9.9s",
+             g_valvula_abierta ? "Abierta" : "Cerrada");
 
-    ILI9488_FillRect(DASH_VALUE_X, 178U,
-                     ILI9488_WIDTH - DASH_VALUE_X, 18U,
-                     ILI9488_COLOR_BLACK);
-    ILI9488_DrawString(DASH_VALUE_X, 178U,
-        g_valvula_abierta ? "Abierta" : "Cerrada",
-        g_valvula_abierta ? ILI9488_COLOR_GREEN : ILI9488_COLOR_WHITE,
-        ILI9488_COLOR_BLACK, 2);
-
-    ILI9488_FillRect(DASH_VALUE_X, 208U,
-                     ILI9488_WIDTH - DASH_VALUE_X, 18U,
-                     ILI9488_COLOR_BLACK);
-    ILI9488_DrawString(DASH_VALUE_X, 208U, "OK",
-                       ILI9488_COLOR_GREEN, ILI9488_COLOR_BLACK, 2);
+    SM_DrawCachedText(DASH_VALUE_X, 148U, motor_fixed,
+                      motor_activo ? ILI9488_COLOR_GREEN
+                                   : ILI9488_COLOR_WHITE,
+                      2U, &g_draw_motor);
+    SM_DrawCachedText(DASH_VALUE_X, 178U, valve_fixed,
+                      g_valvula_abierta ? ILI9488_COLOR_GREEN
+                                        : ILI9488_COLOR_WHITE,
+                      2U, &g_draw_valve);
+    SM_DrawCachedText(DASH_VALUE_X, 208U, "OK       ",
+                      ILI9488_COLOR_GREEN, 2U, &g_draw_comm);
 }
 
 static void SM_UpdateMenuDisplay(void)
 {
     const char *labels[MENU_TOTAL];
-    uint16_t text_width[MENU_TOTAL];
-    uint16_t total_width = 0U;
-    uint16_t gap;
-    uint16_t x;
+    static const uint16_t slot_x[MENU_TOTAL] = {12U, 156U, 264U, 372U};
+    static const uint16_t slot_w[MENU_TOTAL] = {132U,  96U,  96U,  96U};
+    uint16_t text_width;
+    uint16_t text_x;
     uint16_t color;
+    uint8_t label_changed;
     uint8_t i;
 
     if (!SM_IsDashboardState(g_estado))
@@ -936,25 +1073,11 @@ static void SM_UpdateMenuDisplay(void)
     labels[MENU_LLENAR]    = "[Llenar]";
     labels[MENU_VALVULA]   = g_valvula_abierta ? "[Cerrar]" : "[Abrir]";
 
-    ILI9488_FillRect(0U, 282U, ILI9488_WIDTH, 28U, ILI9488_COLOR_BLACK);
-
-    /* Distribuir el espacio libre como márgenes y separaciones iguales. Esto
-     * evita que [Muestrear] quede pegado a [Vaciar]. */
+    /* Cada opción tiene un espacio fijo. Al desplazar la selección sólo se
+     * vuelven a transmitir las dos palabras cuyo color cambia; el renglón
+     * completo ya no se borra ni se dibuja nuevamente. */
     for (i = 0U; i < (uint8_t)MENU_TOTAL; i++)
     {
-        text_width[i] = (uint16_t)strlen(labels[i]) * 12U;
-        total_width = (uint16_t)(total_width + text_width[i]);
-    }
-
-    gap = (total_width < ILI9488_WIDTH)
-              ? (uint16_t)((ILI9488_WIDTH - total_width) /
-                           ((uint16_t)MENU_TOTAL + 1U))
-              : 0U;
-    x = gap;
-
-    for (i = 0U; i < (uint8_t)MENU_TOTAL; i++)
-    {
-
         color = ((MenuOption_t)i == g_menu_selected)
                     ? ILI9488_COLOR_YELLOW : ILI9488_COLOR_WHITE;
 
@@ -967,9 +1090,31 @@ static void SM_UpdateMenuDisplay(void)
             color = ILI9488_COLOR_GREEN;
         }
 
-        ILI9488_DrawString(x, 288U, labels[i], color,
-                           ILI9488_COLOR_BLACK, 2);
-        x = (uint16_t)(x + text_width[i] + gap);
+        text_width = (uint16_t)strlen(labels[i]) * 12U;
+        text_x = (uint16_t)(slot_x[i] +
+                 ((slot_w[i] - text_width) / 2U));
+
+        label_changed = (!g_draw_menu[i].valid ||
+                         (strcmp(g_draw_menu[i].text, labels[i]) != 0))
+                            ? 1U : 0U;
+
+        if (g_draw_menu[i].valid && label_changed)
+        {
+            ILI9488_FillRect(slot_x[i], 282U, slot_w[i], 28U,
+                             ILI9488_COLOR_BLACK);
+        }
+
+        if (label_changed || (g_draw_menu[i].color != color))
+        {
+            ILI9488_DrawString(text_x, 288U, labels[i], color,
+                               ILI9488_COLOR_BLACK, 2U);
+
+            strncpy(g_draw_menu[i].text, labels[i],
+                    sizeof(g_draw_menu[i].text) - 1U);
+            g_draw_menu[i].text[sizeof(g_draw_menu[i].text) - 1U] = '\0';
+            g_draw_menu[i].color = color;
+            g_draw_menu[i].valid = 1U;
+        }
     }
 }
 
@@ -988,17 +1133,17 @@ static void SM_UpdateDashboardClock(void)
                  (unsigned)hour, (unsigned)min);
     }
 
-    /* HH:MM ocupa 60 px a escala 2; X=210 lo centra en un panel de 480 px. */
-    ILI9488_FillRect(204U, 16U, 72U, 20U, ILI9488_COLOR_BLACK);
-    ILI9488_DrawString(210U, 18U, time_text,
-                       ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 2);
+    /* HH:MM ocupa 60 px a escala 2; sólo cambian las cifras necesarias. */
+    SM_DrawCachedText(210U, 18U, time_text,
+                      ILI9488_COLOR_YELLOW, 2U, &g_draw_clock);
     g_ts_dashboard_clock = HAL_GetTick();
 }
 
-static void SM_DrawDashboard(uint8_t batt)
+static void SM_UpdateDashboardBattery(uint8_t batt)
 {
     char batt_text[16];
     uint16_t batt_color;
+    size_t len;
 
     if (batt <= 100U)
     {
@@ -1016,14 +1161,21 @@ static void SM_DrawDashboard(uint8_t batt)
         batt_color = ILI9488_COLOR_WHITE;
     }
 
-    ILI9488_FillRect(0U, 10U, ILI9488_WIDTH, 36U, ILI9488_COLOR_BLACK);
-    /* Escala 2 recupera legibilidad. X=4 deja espacio para mantener la hora
-     * centrada sin que ambos textos se superpongan. */
-    ILI9488_DrawString(4U, 18U, "SISTEMA OPERANDO",
-                       ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
-    SM_UpdateDashboardClock();
-    ILI9488_DrawString(372U, 18U, batt_text,
-                       batt_color, ILI9488_COLOR_BLACK, 2);
+    /* Mantener ocho caracteres para que una cifra anterior se reemplace con
+     * espacios sin borrar la barra superior. */
+    len = strlen(batt_text);
+    while ((len < 8U) && (len < (sizeof(batt_text) - 1U)))
+    {
+        batt_text[len++] = ' ';
+    }
+    batt_text[len] = '\0';
+
+    SM_DrawCachedText(372U, 18U, batt_text,
+                      batt_color, 2U, &g_draw_battery);
+}
+
+static void SM_DrawDashboardBody(void)
+{
 
     if (g_menu_post_sample && g_sample_available)
     {
@@ -1059,6 +1211,18 @@ static void SM_DrawDashboard(uint8_t batt)
     SM_UpdateSensorDisplay();
     SM_UpdateDashboardStatus();
     SM_UpdateMenuDisplay();
+}
+
+static void SM_DrawDashboard(uint8_t batt)
+{
+    /* Esta función se usa sólo al entrar por primera vez al tablero o después
+     * de una limpieza completa. Las transiciones internas usan actualizaciones
+     * parciales y no vuelven a transmitir el encabezado. */
+    ILI9488_DrawString(4U, 18U, "SISTEMA OPERANDO",
+                       ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2U);
+    SM_UpdateDashboardClock();
+    SM_UpdateDashboardBattery(batt);
+    SM_DrawDashboardBody();
 }
 
 static void SM_ToggleValve(void)
@@ -1275,21 +1439,32 @@ static void SM_DrawScreen(void)
     uint8_t previous_dashboard = SM_IsDashboardState(g_screen_last_state);
     uint8_t current_sample_layout =
         (g_menu_post_sample && g_sample_available) ? 1U : 0U;
-
-    /* Sólo el primer dibujo y los cambios hacia/desde la pantalla roja exigen
-     * limpiar el panel completo. Entre estados normales se borran únicamente
-     * las franjas dinámicas, evitando tanto el flash blanco como el barrido. */
-    if (!g_screen_initialized ||
-        (g_estado == STATE_ERROR_CONEXION) ||
-        (g_screen_last_state == STATE_ERROR_CONEXION) ||
-        (current_dashboard != previous_dashboard) ||
-        /* Limpiar cuando cambia la distribución del tablero, aunque entre la
-         * muestra y [Armar] se haya pasado por el modo DESCARGA. */
+    uint8_t layout_changed =
         (current_dashboard && previous_dashboard &&
-         (current_sample_layout != g_screen_last_sample_layout)))
+         (current_sample_layout != g_screen_last_sample_layout)) ? 1U : 0U;
+    uint8_t full_redraw =
+        (!g_screen_initialized ||
+         (g_estado == STATE_ERROR_CONEXION) ||
+         (g_screen_last_state == STATE_ERROR_CONEXION) ||
+         (current_dashboard != previous_dashboard)) ? 1U : 0U;
+
+    /* La pantalla completa sólo se limpia al entrar o salir del tablero. Un
+     * cambio entre la vista normal y "Muestra realizada" borra únicamente
+     * los textos de la distribución anterior. */
+    if (full_redraw)
     {
         ILI9488_FillScreen((g_estado == STATE_ERROR_CONEXION)
                           ? ILI9488_COLOR_RED : ILI9488_COLOR_BLACK);
+
+        if (current_dashboard)
+        {
+            SM_InvalidateDashboardCache();
+        }
+    }
+    else if (layout_changed)
+    {
+        SM_ClearDashboardLayout(g_screen_last_sample_layout);
+        SM_InvalidateDashboardBodyCache();
     }
     else if (!current_dashboard)
     {
@@ -1312,6 +1487,34 @@ static void SM_DrawScreen(void)
     ILI9488_DrawString(6, 6, buf,
                        ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 2);
 #endif
+
+    /* Los estados de operación comparten el mismo tablero. En transiciones
+     * internas se actualizan sólo los campos dinámicos; no se retransmiten
+     * título, etiquetas ni fondo. */
+    if (current_dashboard)
+    {
+        if (full_redraw)
+        {
+            SM_DrawDashboard(batt);
+        }
+        else if (layout_changed)
+        {
+            SM_UpdateDashboardBattery(batt);
+            SM_DrawDashboardBody();
+        }
+        else
+        {
+            SM_UpdateDashboardBattery(batt);
+            SM_UpdateSensorDisplay();
+            SM_UpdateDashboardStatus();
+            SM_UpdateMenuDisplay();
+        }
+
+        g_screen_last_state         = g_estado;
+        g_screen_last_sample_layout = current_sample_layout;
+        g_screen_initialized        = 1U;
+        return;
+    }
 
     /* ---- Barra de estado superior: nivel de batería ---- */
     if ((g_estado != STATE_ERROR_CONEXION) && !current_dashboard)
@@ -1362,47 +1565,6 @@ static void SM_DrawScreen(void)
         ILI9488_DrawTextWrapped(18, 200, ILI9488_WIDTH - 36,
             "Resetee el equipo para reintentar.",
             ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 2);
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case STATE_COMPROBACION_SISTEMA:
-        /* STATUS se consulta en segundo plano sin abrir una pantalla de
-         * verificacion independiente. */
-        SM_DrawDashboard(batt);
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case STATE_SISTEMA_OPERANDO:
-        SM_DrawDashboard(batt);
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case STATE_INICIAR_MUESTREO:
-        /* El muestreo conserva el tablero principal. Los campos Motor y
-         * Valvula muestran inmediatamente Activo y Abierta. */
-        SM_DrawDashboard(batt);
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case STATE_MUESTREO_COMPLETO:
-        SM_DrawDashboard(batt);
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case STATE_CONSULTA:
-        SM_DrawDashboard(batt);
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case STATE_DESCARGA:
-        SM_DrawDashboard(batt);
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case STATE_ARMADO:
-        /* Igual que durante el muestreo, se conserva el tablero. Motor queda
-         * Activo y Valvula queda Cerrada mientras vuelve el vastago. */
-        SM_DrawDashboard(batt);
         break;
 
     default:
@@ -1560,6 +1722,7 @@ static void SM_Run(void)
         ((ahora - g_ts_dashboard_clock) >= DASH_CLOCK_UPDATE_MS))
     {
         SM_UpdateDashboardClock();
+        SM_UpdateDashboardBattery(SM_BatteryPercent());
     }
 
     /* ---- Lógica de cada estado ---- */
@@ -2262,7 +2425,10 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  /* Aumentar el enlace de la TFT de aproximadamente 12 MHz a 24 MHz. El
+   * prescaler 8 reduce a la mitad el tiempo de transferencia sin recurrir a
+   * la frecuencia más exigente del prescaler 4. */
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;

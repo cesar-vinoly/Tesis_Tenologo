@@ -21,6 +21,10 @@ static SPI_HandleTypeDef *s_hspi = NULL;
 static uint8_t s_color_buffer[ILI9488_COLOR_CHUNK_PIXELS * 3U];
 static uint8_t s_char_buffer[(6U * ILI9488_MAX_FONT_SCALE) *
                              (7U * ILI9488_MAX_FONT_SCALE) * 3U];
+/* Línea completa a escala máxima: 480 x 28 píxeles RGB666 = 40320 bytes.
+ * Permite enviar cada texto con una sola ventana y una sola transacción SPI. */
+static uint8_t s_string_buffer[ILI9488_WIDTH *
+                               (7U * ILI9488_MAX_FONT_SCALE) * 3U];
 
 /* -------------------- Fuente 5x7 -------------------- */
 /* Cada fila usa 5 bits. Bit 4 = pixel izquierdo */
@@ -515,12 +519,94 @@ void ILI9488_DrawChar(uint16_t x, uint16_t y, char c, uint16_t color, uint16_t b
 
 void ILI9488_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg, uint8_t scale)
 {
-    while ((*str) != '\0')
+    uint8_t fg_rgb[3];
+    uint8_t bg_rgb[3];
+    uint16_t cell_w;
+    uint16_t cell_h;
+    uint16_t draw_w;
+    uint16_t draw_h;
+    uint16_t py;
+    uint16_t char_index;
+    uint16_t cell_x;
+    uint16_t chars = 0U;
+    uint32_t index = 0U;
+
+    if ((str == NULL) || (scale == 0U) ||
+        (x >= ILI9488_WIDTH) || (y >= ILI9488_HEIGHT))
     {
-        ILI9488_DrawChar(x, y, *str, color, bg, scale);
-        x += (uint16_t)(6U * scale);
-        str++;
+        return;
     }
+
+    /* Conservar la ruta anterior para escalas excepcionales que no caben en
+     * el buffer de línea. La aplicación utiliza escalas de 1 a 4. */
+    if (scale > ILI9488_MAX_FONT_SCALE)
+    {
+        while (*str != '\0')
+        {
+            ILI9488_DrawChar(x, y, *str, color, bg, scale);
+            x += (uint16_t)(6U * scale);
+            str++;
+        }
+        return;
+    }
+
+    cell_w = (uint16_t)(6U * scale);
+    cell_h = (uint16_t)(7U * scale);
+
+    while ((str[chars] != '\0') &&
+           ((uint32_t)x + ((uint32_t)(chars + 1U) * cell_w) <=
+            (uint32_t)ILI9488_WIDTH))
+    {
+        chars++;
+    }
+
+    if (chars == 0U)
+    {
+        return;
+    }
+
+    draw_w = (uint16_t)(chars * cell_w);
+    draw_h = ((y + cell_h) > ILI9488_HEIGHT)
+                 ? (uint16_t)(ILI9488_HEIGHT - y) : cell_h;
+
+    ILI9488_Color565To666(color, fg_rgb);
+    ILI9488_Color565To666(bg, bg_rgb);
+
+    for (py = 0U; py < draw_h; py++)
+    {
+        uint8_t glyph_row = (uint8_t)(py / scale);
+
+        for (char_index = 0U; char_index < chars; char_index++)
+        {
+            const uint8_t *glyph = ILI9488_GetGlyph(str[char_index]);
+
+            for (cell_x = 0U; cell_x < cell_w; cell_x++)
+            {
+                uint8_t glyph_col = (uint8_t)(cell_x / scale);
+                const uint8_t *rgb = bg_rgb;
+
+                if ((glyph_col < 5U) &&
+                    ((glyph[glyph_row] &
+                      (1U << (4U - glyph_col))) != 0U))
+                {
+                    rgb = fg_rgb;
+                }
+
+                s_string_buffer[index++] = rgb[0];
+                s_string_buffer[index++] = rgb[1];
+                s_string_buffer[index++] = rgb[2];
+            }
+        }
+    }
+
+    ILI9488_SetAddressWindow(x, y,
+                             (uint16_t)(x + draw_w - 1U),
+                             (uint16_t)(y + draw_h - 1U));
+    ILI9488_Select();
+    ILI9488_DC_Data();
+    HAL_SPI_Transmit(s_hspi, s_string_buffer, (uint16_t)index,
+                     HAL_MAX_DELAY);
+    ILI9488_Unselect();
 }
 
 void ILI9488_DrawTextWrapped(uint16_t x, uint16_t y, uint16_t max_width, const char *str, uint16_t color, uint16_t bg, uint8_t scale)
