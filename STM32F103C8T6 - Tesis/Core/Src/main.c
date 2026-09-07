@@ -24,13 +24,16 @@
  *   ESPERA    → Idle, responde PING y STATUS en cualquier momento.
  *   MUESTREO  → Abre la electrovalvula y desplaza el vastago hasta PB1.
  *   MUESTREO_COMPLETO → Detiene el motor, cierra la electrovalvula y
- *                       envia MUESTREO_DONE a la superficie.
+ *                       envia MUESTREO_DONE o MUESTREO_ERROR:TIMEOUT.
  *   DESCARGA  → Modo "jog": el usuario controla avance/retroceso del
  *               vástago en vivo desde la superficie (CMD:AVANZAR /
  *               CMD:RETROCEDER / CMD:DETENER), con corte automático
  *               por fin de carrera. También acepta CMD:ARMAR para
  *               saltar directamente a ARMANDO.
  *   ARMANDO   → Mueve el vástago a posición inicial.
+ *   EMERGENCIA → Detiene motor, cierra válvula y mantiene el enclavamiento.
+ *   RECUPERACION_ESPERA → Espera las órdenes expresamente confirmadas.
+ *   RECUPERANDO_FINAL → Mueve únicamente hacia PB1, sin generar una muestra.
  *
  * Sub-pasos del muestreo:
  *   CONFIRMAR      → Enviar MUESTREO_OK a superficie.
@@ -45,6 +48,13 @@
  *   CMD:DETENER     → MOTOR_STOP().
  *   CMD:VALVULA_ABRIR / CMD:VALVULA_CERRAR → control manual de PA6.
  *   CMD:ARMAR       → aborta el jog y pasa a ARMANDO.
+ *
+ * Parada y recuperacion:
+ *   CMD:EMERGENCIA       → detiene motor, cierra valvula y enclava el estado.
+ *   CMD:RESET_EMERGENCIA → habilita la recuperacion, todavia sin movimiento.
+ *   CMD:RECUPERAR_FINAL  → abre valvula y mueve solo hasta PB1.
+ *   CMD:ARMAR            → se acepta despues de haber verificado PB1.
+ *
  *   NOTA: si en el hardware real "avanzar" físicamente corresponde a
  *   subir en vez de bajar, alcanza con intercambiar MOTOR_BAJAR()/
  *   MOTOR_SUBIR() dentro del case STATE_DESCARGA.
@@ -60,7 +70,10 @@ typedef enum
     STATE_MUESTREO,
     STATE_MUESTREO_COMPLETO,
     STATE_DESCARGA,
-    STATE_ARMANDO
+    STATE_ARMANDO,
+    STATE_EMERGENCIA,
+    STATE_RECUPERACION_ESPERA,
+    STATE_RECUPERANDO_FINAL
 } SubState_t;
 typedef enum
 {
@@ -102,6 +115,9 @@ typedef struct
 #define CMD_VALVULA_ABRIR     "CMD:VALVULA_ABRIR"
 #define CMD_VALVULA_CERRAR    "CMD:VALVULA_CERRAR"
 #define CMD_ARMAR             "CMD:ARMAR"
+#define CMD_EMERGENCIA        "CMD:EMERGENCIA"
+#define CMD_RESET_EMERGENCIA  "CMD:RESET_EMERGENCIA"
+#define CMD_RECUPERAR_FINAL   "CMD:RECUPERAR_FINAL"
 #define RSP_ACK               "ACK\r\n"
 #define RSP_VASTAGO_INIT      "VASTAGO:INIT\r\n"
 #define RSP_VASTAGO_FINAL     "VASTAGO:FINAL\r\n"
@@ -120,8 +136,16 @@ typedef struct
 #define RSP_JOG_TIMEOUT       "JOG_ERROR:TIMEOUT\r\n"
 #define RSP_ARMADO_OK         "ARMADO_OK\r\n"
 #define RSP_ARMADO_TIMEOUT    "ARMADO_ERROR:TIMEOUT\r\n"
+#define RSP_ARMADO_FINALES    "ARMADO_ERROR:FINALES_INCOMPATIBLES\r\n"
+#define RSP_EMERGENCIA_ACTIVA "EMERGENCIA:ACTIVA\r\n"
+#define RSP_EMERGENCIA_LIBERADA "EMERGENCIA:LIBERADA\r\n"
+#define RSP_RECUPERACION_INICIADA "RECUPERACION:INICIADA\r\n"
+#define RSP_RECUPERACION_FINAL_OK "RECUPERACION:FINAL_OK\r\n"
+#define RSP_RECUPERACION_TIMEOUT "RECUPERACION_ERROR:TIMEOUT\r\n"
+#define RSP_RECUPERACION_FINALES "RECUPERACION_ERROR:FINALES_INCOMPATIBLES\r\n"
+#define RSP_ARMADO_FINAL_REQUERIDO "ARMADO_ERROR:FINAL_REQUERIDO\r\n"
 /* ---- Tiempos (ms) ---- */
-#define TIMEOUT_MOTOR_MS      35000U   /* 26,4 s teoricos de recorrido + margen */
+#define TIMEOUT_MOTOR_MS      28400U   /* 26,4 s teoricos de recorrido + margen */
 
 /* ---- Keller 4LD / Bar30XT por I2C ---- */
 #define KELLER_I2C_ADDRESS          (0x40U << 1) /* HAL usa direccion desplazada */
@@ -220,6 +244,10 @@ static MuestreoStep_t g_step_mue  = STEP_MUE_CONFIRMAR;
 static ArmadoStep_t   g_step_arm  = STEP_ARM_SUBIR;
 static JogDir_t        g_jog_dir  = JOG_NONE;   /* Direccion activa del jog en DESCARGA */
 static uint32_t       g_ts_paso   = 0U;
+static uint8_t        g_emergencia_latched = 0U;
+static uint8_t        g_armado_emergencia  = 0U;
+static uint8_t        g_recuperacion_final_ok = 0U;
+static uint8_t        g_muestreo_por_timeout = 0U;
 /* USER CODE END PV */
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -616,6 +644,21 @@ static void SM_SetState(SubState_t nuevo)
 static void SM_Run(void)
 {
     uint32_t ahora = HAL_GetTick();
+
+    /* La parada tiene prioridad absoluta sobre cualquier otro comando y sobre
+     * todos los pasos de motor. Queda enclavada hasta completar la secuencia
+     * final -> confirmacion -> armado. */
+    if (rx1_line_ready && UART1_CheckCmd(CMD_EMERGENCIA))
+    {
+        Actuadores_Stop();
+        g_emergencia_latched = 1U;
+        g_armado_emergencia  = 0U;
+        g_recuperacion_final_ok = 0U;
+        SM_SetState(STATE_EMERGENCIA);
+        UART1_Send(RSP_EMERGENCIA_ACTIVA);
+        return;
+    }
+
     /* ================================================================
      * PING, STATUS y SENSOR se atienden sin cambiar el estado activo
      * la operacion en curso.
@@ -624,13 +667,38 @@ static void SM_Run(void)
     {
         if (UART1_CheckCmd(CMD_PING))
         {
+            /* Un PING durante una recuperacion indica que la superficie pudo
+             * reiniciarse. Detener antes de aceptar una nueva sesion. */
+            if (g_emergencia_latched &&
+                ((g_estado == STATE_RECUPERANDO_FINAL) ||
+                 ((g_estado == STATE_ARMANDO) && g_armado_emergencia)))
+            {
+                Actuadores_Stop();
+                g_armado_emergencia = 0U;
+                g_recuperacion_final_ok = 0U;
+                SM_SetState(STATE_EMERGENCIA);
+            }
             UART1_Send(RSP_ACK);
             UART1_ClearLine();
             return;
         }
         if (UART1_CheckCmd(CMD_STATUS))
         {
-            if (FC_INIT_ACTIVO() && FC_FINAL_ACTIVO())
+            if (g_emergencia_latched)
+            {
+                /* STATUS no puede sacar al equipo de la parada. Si proviene de
+                 * una superficie reiniciada, cancelar antes cualquier marcha. */
+                if ((g_estado == STATE_RECUPERANDO_FINAL) ||
+                    ((g_estado == STATE_ARMANDO) && g_armado_emergencia))
+                {
+                    Actuadores_Stop();
+                    g_armado_emergencia = 0U;
+                    g_recuperacion_final_ok = 0U;
+                    SM_SetState(STATE_EMERGENCIA);
+                }
+                UART1_Send(RSP_EMERGENCIA_ACTIVA);
+            }
+            else if (FC_INIT_ACTIVO() && FC_FINAL_ACTIVO())
                 UART1_Send("ERROR:FINALES_INCOMPATIBLES\r\n");
             else if (FC_INIT_ACTIVO())
                 UART1_Send(RSP_VASTAGO_INIT);
@@ -683,6 +751,7 @@ static void SM_Run(void)
             if (UART1_CheckCmd(CMD_INICIAR_MUESTREO))
             {
                 UART1_ClearLine();
+                g_muestreo_por_timeout = 0U;
                 SM_SetState(STATE_MUESTREO);
             }
             else if (UART1_CheckCmd(CMD_DESCARGA))
@@ -695,6 +764,7 @@ static void SM_Run(void)
             else if (UART1_CheckCmd(CMD_ARMAR))
             {
                 UART1_ClearLine();
+                g_armado_emergencia = 0U;
                 SM_SetState(STATE_ARMANDO);
             }
             else
@@ -728,6 +798,7 @@ static void SM_Run(void)
             if (FC_FINAL_ACTIVO())
             {
                 MOTOR_STOP();
+                g_muestreo_por_timeout = 0U;
                 SM_SetState(STATE_MUESTREO_COMPLETO);
             }
             else
@@ -742,6 +813,7 @@ static void SM_Run(void)
             if (FC_FINAL_ACTIVO())
             {
                 MOTOR_STOP();
+                g_muestreo_por_timeout = 0U;
                 SM_SetState(STATE_MUESTREO_COMPLETO);
             }
             else if ((ahora - g_ts_paso) >= TIMEOUT_MOTOR_MS)
@@ -752,6 +824,7 @@ static void SM_Run(void)
                  * ciclo de muestreo.
                  */
                 Actuadores_Stop();
+                g_muestreo_por_timeout = 1U;
                 SM_SetState(STATE_MUESTREO_COMPLETO);
             }
             break;
@@ -766,8 +839,8 @@ static void SM_Run(void)
     /* ----------------------------------------------------------------
      * MUESTREO COMPLETO
      * Primero detiene el motor y cierra la electrovalvula. Solo despues
-     * informa MUESTREO_DONE para que la superficie muestre el resultado
-     * y guarde fecha/hora en la microSD.
+     * informa si termino mediante PB1 o por tiempo, para que la superficie
+     * muestre y registre el resultado sin ocultar la falta del final.
      * ---------------------------------------------------------------- */
     case STATE_MUESTREO_COMPLETO:
         MOTOR_STOP();
@@ -779,7 +852,9 @@ static void SM_Run(void)
             (void)Sensor_ReadAndSend();
         }
 
-        UART1_Send(RSP_MUESTREO_DONE);
+        UART1_Send(g_muestreo_por_timeout ? RSP_MUESTREO_TIMEOUT
+                                           : RSP_MUESTREO_DONE);
+        g_muestreo_por_timeout = 0U;
         SM_SetState(STATE_ESPERA);
         break;
     /* ----------------------------------------------------------------
@@ -895,6 +970,7 @@ static void SM_Run(void)
                 /* Salto directo a armado, confirmado ya en la superficie */
                 UART1_ClearLine();
                 Actuadores_Stop();
+                g_armado_emergencia = 0U;
                 SM_SetState(STATE_ARMANDO);
             }
             else
@@ -911,6 +987,145 @@ static void SM_Run(void)
         }
         break;
     /* ----------------------------------------------------------------
+     * EMERGENCIA — actuadores detenidos y orden enclavada.
+     * RESET_EMERGENCIA solo habilita el estado de recuperacion; el latch se
+     * conserva hasta que el armado posterior termina correctamente.
+     * ---------------------------------------------------------------- */
+    case STATE_EMERGENCIA:
+        Actuadores_Stop();
+
+        if (rx1_line_ready)
+        {
+            if (UART1_CheckCmd(CMD_RESET_EMERGENCIA))
+            {
+                UART1_ClearLine();
+                g_recuperacion_final_ok = 0U;
+                SM_SetState(STATE_RECUPERACION_ESPERA);
+                UART1_Send(RSP_EMERGENCIA_LIBERADA);
+            }
+            else
+            {
+                UART1_ClearLine();
+            }
+        }
+        break;
+
+    /* ----------------------------------------------------------------
+     * RECUPERACION_ESPERA — parada aun enclavada, sin movimiento.
+     * Solo admite ir a posicion final o armar una vez que la superficie lo
+     * confirma. RESET es idempotente para tolerar reintentos de UART.
+     * ---------------------------------------------------------------- */
+    case STATE_RECUPERACION_ESPERA:
+        Actuadores_Stop();
+
+        if (rx1_line_ready)
+        {
+            if (UART1_CheckCmd(CMD_RESET_EMERGENCIA))
+            {
+                UART1_ClearLine();
+                UART1_Send(RSP_EMERGENCIA_LIBERADA);
+            }
+            else if (UART1_CheckCmd(CMD_RECUPERAR_FINAL))
+            {
+                UART1_ClearLine();
+
+                if (FC_INIT_ACTIVO() && FC_FINAL_ACTIVO())
+                {
+                    g_emergencia_latched = 1U;
+                    g_recuperacion_final_ok = 0U;
+                    SM_SetState(STATE_EMERGENCIA);
+                    UART1_Send(RSP_RECUPERACION_FINALES);
+                }
+                else if (FC_FINAL_ACTIVO())
+                {
+                    /* Ya esta en el extremo requerido: no energizar motor. */
+                    g_recuperacion_final_ok = 1U;
+                    UART1_Send(RSP_RECUPERACION_FINAL_OK);
+                }
+                else
+                {
+                    g_recuperacion_final_ok = 0U;
+                    SM_SetState(STATE_RECUPERANDO_FINAL);
+                    VALVULA_ABRIR();
+                    MOTOR_BAJAR();
+                    UART1_Send(RSP_RECUPERACION_INICIADA);
+                }
+            }
+            else if (UART1_CheckCmd(CMD_ARMAR))
+            {
+                UART1_ClearLine();
+                if (!g_recuperacion_final_ok || !FC_FINAL_ACTIVO() ||
+                    FC_INIT_ACTIVO())
+                {
+                    /* Defensa local: ni un comando atrasado puede omitir el
+                     * paso obligatorio por el final de carrera. */
+                    g_recuperacion_final_ok = 0U;
+                    UART1_Send(RSP_ARMADO_FINAL_REQUERIDO);
+                }
+                else
+                {
+                    /* Solo se recibe despues de la segunda confirmacion visible. */
+                    g_armado_emergencia = 1U;
+                    SM_SetState(STATE_ARMANDO);
+                }
+            }
+            else
+            {
+                UART1_ClearLine();
+            }
+        }
+        break;
+
+    /* ----------------------------------------------------------------
+     * RECUPERANDO_FINAL — desplazamiento exclusivo de recuperacion.
+     * No usa STATE_MUESTREO_COMPLETO y, por lo tanto, nunca emite DONE.
+     * ---------------------------------------------------------------- */
+    case STATE_RECUPERANDO_FINAL:
+        if (FC_INIT_ACTIVO() && FC_FINAL_ACTIVO())
+        {
+            Actuadores_Stop();
+            g_emergencia_latched = 1U;
+            g_recuperacion_final_ok = 0U;
+            SM_SetState(STATE_EMERGENCIA);
+            UART1_Send(RSP_RECUPERACION_FINALES);
+            break;
+        }
+
+        if (FC_FINAL_ACTIVO())
+        {
+            Actuadores_Stop();
+            g_recuperacion_final_ok = 1U;
+            SM_SetState(STATE_RECUPERACION_ESPERA);
+            UART1_Send(RSP_RECUPERACION_FINAL_OK);
+            break;
+        }
+
+        if ((ahora - g_ts_paso) >= TIMEOUT_MOTOR_MS)
+        {
+            Actuadores_Stop();
+            g_emergencia_latched = 1U;
+            g_recuperacion_final_ok = 0U;
+            SM_SetState(STATE_EMERGENCIA);
+            UART1_Send(RSP_RECUPERACION_TIMEOUT);
+            break;
+        }
+
+        if (rx1_line_ready)
+        {
+            if (UART1_CheckCmd(CMD_RECUPERAR_FINAL))
+            {
+                /* Repeticion por perdida del ACK: no reiniciar el timeout. */
+                UART1_ClearLine();
+                UART1_Send(RSP_RECUPERACION_INICIADA);
+            }
+            else
+            {
+                UART1_ClearLine();
+            }
+        }
+        break;
+
+    /* ----------------------------------------------------------------
      * ARMANDO
      *   [0] SUBIR         -> Activar motor (subir vastago)
      *   [1] ESPERAR_PB0   -> Aguardar fin de carrera inicial
@@ -920,14 +1135,61 @@ static void SM_Run(void)
         switch (g_step_arm)
         {
         case STEP_ARM_SUBIR:
-            MOTOR_SUBIR();
-            g_step_arm = STEP_ARM_ESPERAR_PB0;
-            g_ts_paso  = ahora;
+            if (FC_INIT_ACTIVO() && FC_FINAL_ACTIVO())
+            {
+                Actuadores_Stop();
+                UART1_Send(RSP_ARMADO_FINALES);
+                if (g_armado_emergencia)
+                {
+                    g_armado_emergencia  = 0U;
+                    g_emergencia_latched = 1U;
+                    g_recuperacion_final_ok = 0U;
+                    SM_SetState(STATE_EMERGENCIA);
+                }
+                else
+                {
+                    SM_SetState(STATE_ESPERA);
+                }
+            }
+            else if (FC_INIT_ACTIVO())
+            {
+                Actuadores_Stop();
+                g_step_arm = STEP_ARM_CONFIRMAR;
+                g_ts_paso  = ahora;
+            }
+            else
+            {
+                /* En recuperacion se abre la valvula antes de invertir el
+                 * recorrido, evitando mover contra presion atrapada. */
+                if (g_armado_emergencia)
+                {
+                    VALVULA_ABRIR();
+                }
+                MOTOR_SUBIR();
+                g_step_arm = STEP_ARM_ESPERAR_PB0;
+                g_ts_paso  = ahora;
+            }
             break;
         case STEP_ARM_ESPERAR_PB0:
-            if (FC_INIT_ACTIVO())
+            if (FC_INIT_ACTIVO() && FC_FINAL_ACTIVO())
             {
-                MOTOR_STOP();
+                Actuadores_Stop();
+                UART1_Send(RSP_ARMADO_FINALES);
+                if (g_armado_emergencia)
+                {
+                    g_armado_emergencia  = 0U;
+                    g_emergencia_latched = 1U;
+                    g_recuperacion_final_ok = 0U;
+                    SM_SetState(STATE_EMERGENCIA);
+                }
+                else
+                {
+                    SM_SetState(STATE_ESPERA);
+                }
+            }
+            else if (FC_INIT_ACTIVO())
+            {
+                Actuadores_Stop();
                 g_step_arm = STEP_ARM_CONFIRMAR;
                 g_ts_paso  = ahora;
             }
@@ -936,22 +1198,52 @@ static void SM_Run(void)
                 /* Timeout: vastago no llego a posicion inicial */
                 Actuadores_Stop();
                 UART1_Send(RSP_ARMADO_TIMEOUT);
-                SM_SetState(STATE_ESPERA);
+                if (g_armado_emergencia)
+                {
+                    g_armado_emergencia  = 0U;
+                    g_emergencia_latched = 1U;
+                    g_recuperacion_final_ok = 0U;
+                    SM_SetState(STATE_EMERGENCIA);
+                }
+                else
+                {
+                    SM_SetState(STATE_ESPERA);
+                }
             }
             break;
         case STEP_ARM_CONFIRMAR:
+            Actuadores_Stop();
             UART1_Send(RSP_ARMADO_OK);
+            if (g_armado_emergencia)
+            {
+                g_emergencia_latched = 0U;
+            }
+            g_armado_emergencia = 0U;
+            g_recuperacion_final_ok = 0U;
             SM_SetState(STATE_ESPERA);
             break;
         default:
             Actuadores_Stop();
-            SM_SetState(STATE_ESPERA);
+            if (g_armado_emergencia)
+            {
+                g_armado_emergencia  = 0U;
+                g_emergencia_latched = 1U;
+                g_recuperacion_final_ok = 0U;
+                SM_SetState(STATE_EMERGENCIA);
+            }
+            else
+            {
+                SM_SetState(STATE_ESPERA);
+            }
             break;
         }
         break;
     default:
         Actuadores_Stop();
-        SM_SetState(STATE_ESPERA);
+        if (g_emergencia_latched)
+            SM_SetState(STATE_EMERGENCIA);
+        else
+            SM_SetState(STATE_ESPERA);
         break;
     }
 }

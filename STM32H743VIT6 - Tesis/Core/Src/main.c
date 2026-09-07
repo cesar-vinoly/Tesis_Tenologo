@@ -32,8 +32,20 @@ typedef enum
     STATE_MUESTREO_COMPLETO,
     STATE_CONSULTA,
     STATE_DESCARGA,
-    STATE_ARMADO
+    STATE_ARMADO,
+    STATE_EMERGENCIA,
+    STATE_CONFIRMAR_RECUPERACION,
+    STATE_RECUPERAR_FINAL,
+    STATE_CONFIRMAR_ARMADO,
+    STATE_AVISO_ARMADO_TIMEOUT
 } SystemState_t;
+
+typedef enum
+{
+    RECOVERY_RESET_EMERGENCY = 0,
+    RECOVERY_START_FINAL,
+    RECOVERY_WAIT_FINAL
+} RecoveryStep_t;
 
 typedef enum
 {
@@ -75,7 +87,16 @@ typedef struct
  *  SENSOR\r\n           →    T=XX.XXD=XX.XX\r\n
  *  CMD:MUESTREO\r\n     →    MUESTREO_OK\r\n  (confirmación inicio)
  *                       →    MUESTREO_DONE\r\n (muestra realizada, asíncrono)
+ *                       →    MUESTREO_ERROR:TIMEOUT\r\n (sin final de carrera)
  *  CMD:ARMAR\r\n        →    ARMADO_OK\r\n
+ *                       →    ARMADO_ERROR:TIMEOUT\r\n (sin final de carrera)
+ *
+ *  ---- Parada de emergencia y recuperacion controlada ----
+ *  CMD:EMERGENCIA\r\n        →    EMERGENCIA:ACTIVA\r\n
+ *  CMD:RESET_EMERGENCIA\r\n  →    EMERGENCIA:LIBERADA\r\n
+ *  CMD:RECUPERAR_FINAL\r\n   →    RECUPERACION:INICIADA\r\n
+ *                            →    RECUPERACION:FINAL_OK\r\n
+ *  CMD:ARMAR\r\n             →    ARMADO_OK\r\n
  *
  *  ---- Modo DESCARGA (jog manual del vástago) ----
  *  CMD:DESCARGA\r\n     →    MODO:DESCARGA\r\n      (entra a modo jog)
@@ -99,6 +120,9 @@ typedef struct
 #define CMD_VALVULA_ABRIR     "CMD:VALVULA_ABRIR\r\n"
 #define CMD_VALVULA_CERRAR    "CMD:VALVULA_CERRAR\r\n"
 #define CMD_ARMAR             "CMD:ARMAR\r\n"
+#define CMD_EMERGENCIA        "CMD:EMERGENCIA\r\n"
+#define CMD_RESET_EMERGENCIA  "CMD:RESET_EMERGENCIA\r\n"
+#define CMD_RECUPERAR_FINAL   "CMD:RECUPERAR_FINAL\r\n"
 
 #define RSP_ACK               "ACK"
 #define RSP_VASTAGO_INIT      "VASTAGO:INIT"
@@ -106,6 +130,7 @@ typedef struct
 #define RSP_VASTAGO_INTERMEDIO "VASTAGO:INTERMEDIO"
 #define RSP_MUESTREO_OK       "MUESTREO_OK"
 #define RSP_MUESTREO_DONE     "MUESTREO_DONE"
+#define RSP_MUESTREO_TIMEOUT  "MUESTREO_ERROR:TIMEOUT"
 #define RSP_MODO_DESCARGA     "MODO:DESCARGA"
 #define RSP_JOG_AVANZANDO     "JOG:AVANZANDO"
 #define RSP_JOG_RETROCEDIENDO "JOG:RETROCEDIENDO"
@@ -117,15 +142,32 @@ typedef struct
 #define RSP_JOG_TIMEOUT       "JOG_ERROR:TIMEOUT"
 #define RSP_ARMADO_OK         "ARMADO_OK"
 #define RSP_ARMADO_TIMEOUT    "ARMADO_ERROR:TIMEOUT"
+#define RSP_ARMADO_FINALES    "ARMADO_ERROR:FINALES_INCOMPATIBLES"
+#define RSP_ARMADO_ERROR      "ARMADO_ERROR:"
+#define RSP_EMERGENCIA_ACTIVA "EMERGENCIA:ACTIVA"
+#define RSP_EMERGENCIA_LIBERADA "EMERGENCIA:LIBERADA"
+#define RSP_RECUPERACION_INICIADA "RECUPERACION:INICIADA"
+#define RSP_RECUPERACION_FINAL_OK "RECUPERACION:FINAL_OK"
+#define RSP_RECUPERACION_ERROR "RECUPERACION_ERROR:"
+#define RSP_FINALES_INCOMPATIBLES "ERROR:FINALES_INCOMPATIBLES"
 
 /* ---- Tiempos (ms) ---- */
 #define TIMEOUT_CONEXION_MS    20000U  /* Tiempo máx. para establecer conexión */
 #define TIMEOUT_RESPUESTA_MS    3000U  /* Tiempo máx. esperando respuesta a cmd */
 #define INTERVALO_PING_MS       1000U  /* Período entre reintentos de PING      */
 #define INTERVALO_SENSOR_MS      500U  /* Consulta periodica de T=...D=...      */
+#define LINK_WARNING_MS         1500U  /* Mostrar que no llegan respuestas       */
+#define LINK_LOSS_TIMEOUT_MS    5000U  /* Declarar perdida de comunicacion        */
+#define LINK_PROBE_INTERVAL_MS  1000U  /* Separacion minima entre PING de enlace  */
 #define DASH_CLOCK_UPDATE_MS   10000U  /* El encabezado muestra solo HH:MM      */
 #define TIMEOUT_MUESTREO_MS    60000U  /* Tiempo máx. para completar muestreo   */
 #define TIMEOUT_ARMADO_MS      45000U  /* Espera el timeout de 35 s del sumergido */
+#define INTERVALO_EMERGENCIA_MS  500U  /* Reenvio hasta confirmar la parada       */
+#define INTERVALO_RECOVERY_CMD_MS 1000U /* Reenvio de ordenes previas al movimiento */
+#define TIMEOUT_RECOVERY_LINK_MS 10000U /* Maximo para habilitar/iniciar recuperacion */
+#define TIMEOUT_RECOVERY_MOVE_MS 45000U /* Recorrido a final: timeout sumergido + margen */
+#define STARTUP_ANIMATION_MS        500U /* Periodo de los puntos durante el inicio       */
+#define RECOVERY_ANIMATION_MS       500U /* Periodo de los puntos de carga              */
 #define DEBOUNCE_MS               50U  /* Antirrebote de botones                */
 
 /* ---- GPIO: Botones del menu ----
@@ -133,7 +175,7 @@ typedef struct
  *                   En Vaciar/Llenar: mantener presionado para mover.
  *   Btn 2 (PD9)  -> desplazar la seleccion hacia la izquierda.
  *   Btn 3 (PB15) -> desplazar la seleccion hacia la derecha.
- *   Btn 4 (PD10) -> reservado para una funcion futura.
+ *   Btn 4 (PD10) -> parada de emergencia enclavada por software.
  */
 #define BTN_SELECT_PORT       GPIOD
 #define BTN_SELECT_PIN        GPIO_PIN_8
@@ -178,6 +220,8 @@ typedef struct
 #define BATT_PERCENT_HYSTERESIS   3U
 #define BATT_FULL_ZONE_PERCENT   98U
 #define BATT_FULL_RELEASE_PERCENT 92U
+#define BATT_LOW_ENTER_PERCENT   20U
+#define BATT_LOW_RELEASE_PERCENT 25U
 
 /* Diagnóstico temporal: muestra las cuentas y los milivoltios calculados
  * por el ADC en la esquina superior izquierda. Cambiar a 0U al finalizar. */
@@ -238,6 +282,7 @@ static volatile uint32_t g_adc_vref_mv   = 0U;
 static uint32_t g_batt_filtered_mv = 0U;
 static uint32_t g_batt_last_measure_tick = 0U;
 static uint8_t g_batt_measurement_valid = 0U;
+static uint8_t g_batt_low_warning = 0U;
 
 /* ---- Estado de la máquina ---- */
 static SystemState_t g_estado        = STATE_INICIO;   /* Estado activo */
@@ -245,6 +290,10 @@ static uint32_t      g_ts_conexion   = 0U;  /* Tick al entrar a ESTABLECER_CONEX
 static uint32_t      g_ts_ping       = 0U;  /* Tick del último PING enviado         */
 static uint32_t      g_ts_respuesta  = 0U;  /* Tick al enviar un comando            */
 static uint32_t      g_ts_muestreo   = 0U;  /* Tick al iniciar el muestreo          */
+static uint32_t      g_ts_startup_animation = 0U;
+static uint8_t       g_startup_animation_frame = 0U;
+static uint32_t      g_ts_last_comm_rx = 0U;
+static uint8_t       g_link_warning = 0U;
 static uint8_t       g_esperando_rsp = 0U;  /* 1 = comando enviado, esperando reply */
 static char          g_uart_rx[UARTUTILS_LINE_MAX]; /* Última línea UART recibida   */
 static uint8_t       g_screen_initialized = 0U;
@@ -276,6 +325,21 @@ static uint8_t      g_btn_select_prev     = 0U;
 static uint8_t      g_btn_left_prev       = 0U;
 static uint8_t      g_btn_right_prev      = 0U;
 static uint32_t     g_ts_dashboard_clock  = 0U;
+
+/* ---- Parada de emergencia y recuperacion ---- */
+static uint8_t       g_emergency_latched   = 0U;
+static uint8_t       g_emergency_confirmed = 0U;
+static uint8_t       g_emergency_error     = 0U;
+static uint8_t       g_btn4_prev            = 0U;
+static uint8_t       g_muestreo_cancelado  = 0U;
+static uint8_t       g_muestreo_por_timeout = 0U;
+static uint8_t       g_confirm_yes         = 0U;
+static uint8_t       g_armado_recuperacion = 0U;
+static RecoveryStep_t g_recovery_step      = RECOVERY_RESET_EMERGENCY;
+static uint32_t      g_ts_emergency_tx     = 0U;
+static uint32_t      g_ts_recovery         = 0U;
+static uint32_t      g_ts_recovery_animation = 0U;
+static uint8_t       g_recovery_animation_frame = 0U;
 
 /* ---- Fecha/hora del último muestreo (RTC DS3231), para log y pantalla ---- */
 static char g_ultimo_muestreo_ts[24] = "";
@@ -316,8 +380,11 @@ static void    SM_DrawScreen(void);
 /* Helpers */
 static void    SM_SendCmd(const char *cmd);
 static uint8_t SM_CheckResponse(const char *expected);
+static uint8_t SM_IsModuleResponse(const char *line);
 static uint8_t SM_ProcessPositionResponse(void);
 static void    SM_ServiceDashboardQueries(void);
+static uint8_t SM_ServiceConnectionWatchdog(uint32_t ahora);
+static void    SM_RegisterModuleResponse(uint32_t ahora);
 static uint8_t SM_ButtonPressed(GPIO_TypeDef *port, uint16_t pin);
 static uint8_t SM_ButtonEdge(GPIO_TypeDef *port, uint16_t pin, uint8_t *prev);
 static uint8_t SM_BatteryPercent(void);
@@ -329,17 +396,31 @@ static void    SM_InvalidateDashboardBodyCache(void);
 static void    SM_InvalidateDashboardCache(void);
 static void    SM_UpdateSensorDisplay(void);
 static uint8_t SM_IsDashboardState(SystemState_t state);
+static uint8_t SM_IsEmergencyState(SystemState_t state);
+static void    SM_DrawCenteredString(uint16_t y, const char *text,
+                                     uint16_t color, uint16_t bg,
+                                     uint8_t scale);
+static void    SM_DrawCenteredField(uint16_t y, const char *text,
+                                    uint16_t color, uint16_t bg,
+                                    uint8_t scale, uint8_t field_chars);
+static void    SM_DrawCenteredOptions(uint16_t y, uint16_t bg);
+static void    SM_ClearEmergencyScreenContent(void);
+static void    SM_UpdateStartupAnimation(uint8_t force_redraw);
+static void    SM_UpdateRecoveryAnimation(uint8_t force_redraw);
 static void    SM_DrawDashboard(uint8_t batt);
 static void    SM_DrawDashboardBody(void);
 static void    SM_ClearDashboardLayout(uint8_t sample_layout);
 static void    SM_UpdateDashboardClock(void);
 static void    SM_UpdateDashboardBattery(uint8_t batt);
 static void    SM_UpdateDashboardStatus(void);
+static void    SM_UpdateConnectionDisplay(void);
 static void    SM_UpdateMenuDisplay(void);
 static void    SM_HandleMenu(void);
 static void    SM_RequestManualMode(MenuOption_t option);
 static void    SM_ToggleValve(void);
 static void    SM_ClearPreviousScreenContent(void);
+static void    SM_ActivateEmergency(uint8_t recovery_error);
+static void    SM_HandleSafetyConfirmation(uint8_t confirm_armado);
 
 /* RTC DS3231 (I2C1) */
 static HAL_StatusTypeDef DS3231_ReadDateTime(uint8_t *year, uint8_t *month, uint8_t *day,
@@ -388,6 +469,32 @@ static void SM_SendCmd(const char *cmd)
 static uint8_t SM_CheckResponse(const char *expected)
 {
     return (strstr(g_uart_rx, expected) != NULL) ? 1U : 0U;
+}
+
+/* Acepta solamente respuestas pertenecientes al protocolo del modulo
+ * sumergido. Una linea incompleta o ruido UART no mantiene vivo el enlace. */
+static uint8_t SM_IsModuleResponse(const char *line)
+{
+    if (line == NULL)
+    {
+        return 0U;
+    }
+
+    return ((strstr(line, "ACK") != NULL) ||
+            (strstr(line, "VASTAGO:") != NULL) ||
+            (strstr(line, "MUESTREO_") != NULL) ||
+            (strstr(line, "MUESTREO_ERROR:") != NULL) ||
+            (strstr(line, "MODO:DESCARGA") != NULL) ||
+            (strstr(line, "JOG:") != NULL) ||
+            (strstr(line, "JOG_ERROR:") != NULL) ||
+            (strstr(line, "LIMITE:") != NULL) ||
+            (strstr(line, "VALVULA:") != NULL) ||
+            (strstr(line, "ARMADO_") != NULL) ||
+            (strstr(line, "ARMADO_ERROR:") != NULL) ||
+            (strstr(line, "EMERGENCIA:") != NULL) ||
+            (strstr(line, "RECUPERACION:") != NULL) ||
+            (strstr(line, "RECUPERACION_ERROR:") != NULL) ||
+            (strstr(line, "ERROR:FINALES_INCOMPATIBLES") != NULL)) ? 1U : 0U;
 }
 
 /* --------------------------------------------------------------------------
@@ -489,6 +596,97 @@ static uint8_t SM_ButtonEdge(GPIO_TypeDef *port, uint16_t pin, uint8_t *prev)
     uint8_t flanco = (actual && !(*prev)) ? 1U : 0U;
     *prev = actual;
     return flanco;
+}
+
+/* --------------------------------------------------------------------------
+ * SM_ActivateEmergency
+ * Enclava la parada local y ordena al modulo sumergido detener motor y cerrar
+ * valvula. Se envia antes de redibujar la TFT para minimizar la latencia.
+ * -------------------------------------------------------------------------- */
+static void SM_ActivateEmergency(uint8_t recovery_error)
+{
+    uint8_t sampling_in_progress =
+        (g_estado == STATE_INICIAR_MUESTREO) ? 1U : 0U;
+
+    if (sampling_in_progress)
+    {
+        /* Una muestra interrumpida nunca debe mostrarse ni registrarse en SD. */
+        g_muestreo_cancelado = 1U;
+        g_muestreo_por_timeout = 0U;
+        g_sample_available   = 0U;
+        g_menu_post_sample   = 0U;
+        strncpy(g_sample_temp, "--.-", sizeof(g_sample_temp));
+        g_sample_temp[sizeof(g_sample_temp) - 1U] = '\0';
+        strncpy(g_sample_depth, "--.-", sizeof(g_sample_depth));
+        g_sample_depth[sizeof(g_sample_depth) - 1U] = '\0';
+    }
+
+    g_emergency_latched   = 1U;
+    g_emergency_confirmed = 0U;
+    g_emergency_error     = recovery_error;
+    g_btn4_prev            =
+        (HAL_GPIO_ReadPin(BTN_4_PORT, BTN_4_PIN) == GPIO_PIN_SET) ? 1U : 0U;
+    g_armado_recuperacion = 0U;
+    g_confirm_yes         = 0U;
+
+    SM_SendCmd(CMD_EMERGENCIA);
+    g_ts_emergency_tx = HAL_GetTick();
+    SM_SetState(STATE_EMERGENCIA);
+}
+
+/* --------------------------------------------------------------------------
+ * SM_HandleSafetyConfirmation
+ * Btn 2 selecciona NO, Btn 3 selecciona SI y Btn 1 confirma. NO mantiene o
+ * vuelve a enclavar la parada; nunca inicia movimiento por si solo.
+ * -------------------------------------------------------------------------- */
+static void SM_HandleSafetyConfirmation(uint8_t confirm_armado)
+{
+    uint8_t select_now;
+    uint8_t select_edge;
+    uint8_t left_edge;
+    uint8_t right_edge;
+
+    select_now  = SM_ButtonPressed(BTN_SELECT_PORT, BTN_SELECT_PIN);
+    select_edge = (select_now && !g_btn_select_prev) ? 1U : 0U;
+    g_btn_select_prev = select_now;
+
+    left_edge = SM_ButtonEdge(BTN_LEFT_PORT, BTN_LEFT_PIN,
+                              &g_btn_left_prev);
+    right_edge = SM_ButtonEdge(BTN_RIGHT_PORT, BTN_RIGHT_PIN,
+                               &g_btn_right_prev);
+
+    if (left_edge)
+    {
+        g_confirm_yes = 0U;
+        SM_DrawScreen();
+        return;
+    }
+
+    if (right_edge)
+    {
+        g_confirm_yes = 1U;
+        SM_DrawScreen();
+        return;
+    }
+
+    if (!select_edge)
+    {
+        return;
+    }
+
+    if (!g_confirm_yes)
+    {
+        SM_ActivateEmergency(0U);
+    }
+    else if (confirm_armado)
+    {
+        g_armado_recuperacion = 1U;
+        SM_SetState(STATE_ARMADO);
+    }
+    else
+    {
+        SM_SetState(STATE_RECUPERAR_FINAL);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -776,6 +974,21 @@ static uint8_t SM_BatteryPercent(void)
         g_batt_last_percent = porcentaje;
     }
 
+    /* El aviso no oscila cuando la lectura queda alrededor del umbral:
+     * aparece al llegar a 20 % y se libera solamente después de recuperar
+     * al menos 25 % (por ejemplo, tras sustituir la batería). */
+    if (g_batt_low_warning)
+    {
+        if (g_batt_last_percent >= BATT_LOW_RELEASE_PERCENT)
+        {
+            g_batt_low_warning = 0U;
+        }
+    }
+    else if (g_batt_last_percent <= BATT_LOW_ENTER_PERCENT)
+    {
+        g_batt_low_warning = 1U;
+    }
+
     return g_batt_last_percent;
 }
 
@@ -839,6 +1052,198 @@ static uint8_t SM_IsDashboardState(SystemState_t state)
             (state == STATE_CONSULTA) ||
             (state == STATE_DESCARGA) ||
             (state == STATE_ARMADO)) ? 1U : 0U;
+}
+
+static uint8_t SM_IsEmergencyState(SystemState_t state)
+{
+    return ((state == STATE_EMERGENCIA) ||
+            (state == STATE_CONFIRMAR_RECUPERACION) ||
+            (state == STATE_RECUPERAR_FINAL) ||
+            (state == STATE_CONFIRMAR_ARMADO)) ? 1U : 0U;
+}
+
+/* Centra una linea de la fuente 5x7. ILI9488_DrawString utiliza una celda de
+ * 6 pixeles de ancho por caracter y por factor de escala. */
+static void SM_DrawCenteredString(uint16_t y, const char *text,
+                                  uint16_t color, uint16_t bg,
+                                  uint8_t scale)
+{
+    uint32_t text_width;
+    uint16_t x = 0U;
+
+    if ((text == NULL) || (scale == 0U))
+    {
+        return;
+    }
+
+    text_width = (uint32_t)strlen(text) * 6U * (uint32_t)scale;
+    if (text_width < ILI9488_WIDTH)
+    {
+        x = (uint16_t)(((uint32_t)ILI9488_WIDTH - text_width) / 2U);
+    }
+
+    ILI9488_DrawString(x, y, text, color, bg, scale);
+}
+
+/* Sobrescribe un campo centrado de ancho constante. Los espacios forman
+ * parte de la misma transferencia que el texto, por lo que una cadena nueva
+ * sustituye a la anterior sin la fase visible de borrar y luego dibujar. */
+static void SM_DrawCenteredField(uint16_t y, const char *text,
+                                 uint16_t color, uint16_t bg,
+                                 uint8_t scale, uint8_t field_chars)
+{
+    char field[33];
+    size_t text_len;
+    size_t left_padding;
+    uint32_t field_width;
+    uint16_t x;
+
+    if ((text == NULL) || (scale == 0U) ||
+        (field_chars == 0U) || (field_chars >= sizeof(field)))
+    {
+        return;
+    }
+
+    field_width = (uint32_t)field_chars * 6U * (uint32_t)scale;
+    if (field_width > ILI9488_WIDTH)
+    {
+        return;
+    }
+
+    text_len = strlen(text);
+    if (text_len > field_chars)
+    {
+        text_len = field_chars;
+    }
+
+    memset(field, ' ', field_chars);
+    left_padding = ((size_t)field_chars - text_len) / 2U;
+    memcpy(&field[left_padding], text, text_len);
+    field[field_chars] = '\0';
+
+    x = (uint16_t)(((uint32_t)ILI9488_WIDTH - field_width) / 2U);
+    ILI9488_DrawString(x, y, field, color, bg, scale);
+}
+
+/* Dibuja NO y SI como un unico grupo centrado. Los corchetes y el color
+ * amarillo identifican la opcion seleccionada. */
+static void SM_DrawCenteredOptions(uint16_t y, uint16_t bg)
+{
+    const uint8_t scale = 3U;
+    const uint16_t gap = 72U;
+    const char *left_text  = g_confirm_yes ? " NO " : "[NO]";
+    const char *right_text = g_confirm_yes ? "[SI]" : " SI ";
+    uint16_t left_width =
+        (uint16_t)(strlen(left_text) * 6U * (uint32_t)scale);
+    uint16_t right_width =
+        (uint16_t)(strlen(right_text) * 6U * (uint32_t)scale);
+    uint16_t total_width = (uint16_t)(left_width + gap + right_width);
+    uint16_t x = (uint16_t)((ILI9488_WIDTH - total_width) / 2U);
+
+    ILI9488_DrawString(x, y, left_text,
+        g_confirm_yes ? ILI9488_COLOR_WHITE : ILI9488_COLOR_YELLOW,
+        bg, scale);
+    ILI9488_DrawString((uint16_t)(x + left_width + gap), y, right_text,
+        g_confirm_yes ? ILI9488_COLOR_YELLOW : ILI9488_COLOR_WHITE,
+        bg, scale);
+}
+
+/* Todas las etapas de la recuperación conservan el fondo rojo mientras la
+ * parada permanece enclavada. En una transición se borran sólo las franjas
+ * que contienen texto; el resto del cuadro nunca vuelve a transmitirse. */
+static void SM_ClearEmergencyScreenContent(void)
+{
+    switch (g_screen_last_state)
+    {
+    case STATE_EMERGENCIA:
+        SM_DrawCenteredField(35U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_RED, 3U, 20U);
+        SM_DrawCenteredField(105U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_RED, 2U, 32U);
+        SM_DrawCenteredField(155U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_RED, 2U, 31U);
+        SM_DrawCenteredField(230U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_RED, 2U, 32U);
+        break;
+
+    case STATE_CONFIRMAR_RECUPERACION:
+    case STATE_CONFIRMAR_ARMADO:
+        SM_DrawCenteredField(45U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_RED, 3U, 20U);
+        SM_DrawCenteredField(125U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_RED, 2U, 32U);
+        SM_DrawCenteredField(210U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_RED, 3U, 12U);
+        break;
+
+    case STATE_RECUPERAR_FINAL:
+        SM_DrawCenteredField(149U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_RED, 3U, 24U);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* Animacion de inicio no bloqueante. El campo de ancho fijo reemplaza los
+ * puntos por espacios dentro de la misma escritura y evita parpadeos. */
+static void SM_UpdateStartupAnimation(uint8_t force_redraw)
+{
+    uint32_t ahora = HAL_GetTick();
+    char text[20];
+
+    if (!force_redraw &&
+        ((ahora - g_ts_startup_animation) < STARTUP_ANIMATION_MS))
+    {
+        return;
+    }
+
+    if (force_redraw)
+    {
+        g_startup_animation_frame = 0U;
+    }
+    else
+    {
+        g_startup_animation_frame =
+            (uint8_t)((g_startup_animation_frame + 1U) % 4U);
+    }
+
+    g_ts_startup_animation = ahora;
+    snprintf(text, sizeof(text), "Iniciando%.*s",
+             (int)g_startup_animation_frame, "...");
+
+    SM_DrawCenteredField(149U, text,
+                         ILI9488_COLOR_YELLOW,
+                         ILI9488_COLOR_BLACK, 3U, 16U);
+}
+
+/* Animacion no bloqueante: actualiza solo la franja central, evitando borrar
+ * toda la pantalla y producir parpadeo en cada cambio de puntos. */
+static void SM_UpdateRecoveryAnimation(uint8_t force_redraw)
+{
+    uint32_t ahora = HAL_GetTick();
+    char text[32];
+
+    if (!force_redraw &&
+        ((ahora - g_ts_recovery_animation) < RECOVERY_ANIMATION_MS))
+    {
+        return;
+    }
+
+    if (!force_redraw)
+    {
+        g_recovery_animation_frame =
+            (uint8_t)((g_recovery_animation_frame + 1U) % 4U);
+    }
+
+    g_ts_recovery_animation = ahora;
+    snprintf(text, sizeof(text), "Recuperando sistema%.*s",
+             (int)g_recovery_animation_frame, "...");
+
+    SM_DrawCenteredField(149U, text,
+                         ILI9488_COLOR_YELLOW,
+                         ILI9488_COLOR_RED, 3U, 24U);
 }
 
 /* Dibuja el texto completo la primera vez. En actualizaciones posteriores
@@ -927,10 +1332,10 @@ static void SM_ClearDashboardLayout(uint8_t sample_layout)
 
     if (sample_layout)
     {
-        ILI9488_FillRect(130U,  58U, 220U, 20U, ILI9488_COLOR_BLACK);
+        ILI9488_FillRect( 54U,  58U, 372U, 20U, ILI9488_COLOR_BLACK);
         ILI9488_FillRect(170U,  94U, 140U, 20U, ILI9488_COLOR_BLACK);
         ILI9488_FillRect(200U, 124U,  80U, 20U, ILI9488_COLOR_BLACK);
-        ILI9488_FillRect( 80U, 168U, 330U, 20U, ILI9488_COLOR_BLACK);
+        ILI9488_FillRect( 54U, 168U, 372U, 20U, ILI9488_COLOR_BLACK);
         ILI9488_FillRect(105U, 214U, 310U, 20U, ILI9488_COLOR_BLACK);
         ILI9488_FillRect(105U, 244U, 310U, 20U, ILI9488_COLOR_BLACK);
     }
@@ -1048,19 +1453,109 @@ static void SM_UpdateDashboardStatus(void)
                       g_valvula_abierta ? ILI9488_COLOR_GREEN
                                         : ILI9488_COLOR_WHITE,
                       2U, &g_draw_valve);
-    SM_DrawCachedText(DASH_VALUE_X, 208U, "OK       ",
-                      ILI9488_COLOR_GREEN, 2U, &g_draw_comm);
+    SM_UpdateConnectionDisplay();
+}
+
+/* Estado visual del enlace. El aviso se actualiza de forma independiente para
+ * no redibujar motor, valvula ni el resto del tablero. */
+static void SM_UpdateConnectionDisplay(void)
+{
+    const char *status_text;
+    uint16_t color;
+    char status_fixed[12];
+
+    if (!SM_IsDashboardState(g_estado) ||
+        (g_menu_post_sample && g_sample_available))
+    {
+        return;
+    }
+
+    status_text = g_link_warning ? "Sin resp." : "OK";
+    color = g_link_warning ? ILI9488_COLOR_YELLOW : ILI9488_COLOR_GREEN;
+    snprintf(status_fixed, sizeof(status_fixed), "%-9.9s", status_text);
+
+    SM_DrawCachedText(DASH_VALUE_X, 208U, status_fixed,
+                      color, 2U, &g_draw_comm);
+}
+
+/* Toda respuesta valida reinicia el supervisor y restaura inmediatamente el
+ * indicador verde si el enlace se recupera antes del timeout. */
+static void SM_RegisterModuleResponse(uint32_t ahora)
+{
+    uint8_t warning_was_visible = g_link_warning;
+
+    g_ts_last_comm_rx = ahora;
+    g_link_warning = 0U;
+
+    if (warning_was_visible)
+    {
+        SM_UpdateConnectionDisplay();
+    }
+}
+
+/* Supervisa solamente las pantallas operativas que muestran "Comunicacion".
+ * Durante la recuperacion de emergencia no se envian PING: el sumergido los
+ * interpreta deliberadamente como el reinicio de la superficie y detendria el
+ * movimiento de recuperacion. */
+static uint8_t SM_ServiceConnectionWatchdog(uint32_t ahora)
+{
+    uint32_t silence_ms;
+
+    if (!SM_IsDashboardState(g_estado) || g_emergency_latched)
+    {
+        return 0U;
+    }
+
+    silence_ms = ahora - g_ts_last_comm_rx;
+
+    if (silence_ms >= LINK_LOSS_TIMEOUT_MS)
+    {
+        /* Intento preventivo: si el canal de transmision aun funciona, el
+         * sumergido detiene motor y cierra valvula antes de mostrar el error. */
+        if (g_estado == STATE_INICIAR_MUESTREO)
+        {
+            g_muestreo_cancelado = 1U;
+            g_sample_available = 0U;
+        }
+
+        SM_SendCmd(CMD_EMERGENCIA);
+        g_emergency_latched = 1U;
+        SM_SetState(STATE_ERROR_CONEXION);
+        return 1U;
+    }
+
+    if (silence_ms >= LINK_WARNING_MS)
+    {
+        if (!g_link_warning)
+        {
+            g_link_warning = 1U;
+            SM_UpdateConnectionDisplay();
+        }
+
+        /* Las consultas STATUS/SENSOR ya actuan como prueba de enlace. PING
+         * se agrega sólo si no se transmitio otro comando recientemente, por
+         * ejemplo durante muestreo, armado o al permanecer en el resultado. */
+        if ((g_ts_periodic_request == 0U) ||
+            ((ahora - g_ts_periodic_request) >= LINK_PROBE_INTERVAL_MS))
+        {
+            SM_SendCmd(CMD_PING);
+        }
+    }
+
+    return 0U;
 }
 
 static void SM_UpdateMenuDisplay(void)
 {
-    const char *labels[MENU_TOTAL];
+    const char *base_labels[MENU_TOTAL];
+    char labels[MENU_TOTAL][12];
+    char decorated[12];
     static const uint16_t slot_x[MENU_TOTAL] = {12U, 156U, 264U, 372U};
-    static const uint16_t slot_w[MENU_TOTAL] = {132U,  96U,  96U,  96U};
-    uint16_t text_width;
-    uint16_t text_x;
+    static const uint8_t slot_chars[MENU_TOTAL] = {11U, 8U, 8U, 8U};
+    size_t label_len;
+    size_t left_padding;
     uint16_t color;
-    uint8_t label_changed;
+    uint8_t selected;
     uint8_t i;
 
     if (!SM_IsDashboardState(g_estado))
@@ -1068,18 +1563,41 @@ static void SM_UpdateMenuDisplay(void)
         return;
     }
 
-    labels[MENU_PRINCIPAL] = g_menu_post_sample ? "[Armar]" : "[Muestrear]";
-    labels[MENU_VACIAR]    = "[Vaciar]";
-    labels[MENU_LLENAR]    = "[Llenar]";
-    labels[MENU_VALVULA]   = g_valvula_abierta ? "[Cerrar]" : "[Abrir]";
+    base_labels[MENU_PRINCIPAL] = g_menu_post_sample ? "Armar" : "Muestrear";
+    base_labels[MENU_VACIAR]    = "Vaciar";
+    base_labels[MENU_LLENAR]    = "Llenar";
+    base_labels[MENU_VALVULA]   = g_valvula_abierta ? "Cerrar" : "Abrir";
 
-    /* Cada opción tiene un espacio fijo. Al desplazar la selección sólo se
-     * vuelven a transmitir las dos palabras cuyo color cambia; el renglón
-     * completo ya no se borra ni se dibuja nuevamente. */
+    /* Cada opción ocupa siempre la misma cantidad de caracteres. Solamente la
+     * seleccionada recibe corchetes, que se sobrescriben junto con los espacios
+     * al desplazarse sin borrar previamente la franja inferior. */
     for (i = 0U; i < (uint8_t)MENU_TOTAL; i++)
     {
-        color = ((MenuOption_t)i == g_menu_selected)
-                    ? ILI9488_COLOR_YELLOW : ILI9488_COLOR_WHITE;
+        selected = ((MenuOption_t)i == g_menu_selected) ? 1U : 0U;
+
+        if (selected)
+        {
+            (void)snprintf(decorated, sizeof(decorated), "[%s]",
+                           base_labels[i]);
+        }
+        else
+        {
+            (void)snprintf(decorated, sizeof(decorated), "%s",
+                           base_labels[i]);
+        }
+
+        label_len = strlen(decorated);
+        if (label_len > slot_chars[i])
+        {
+            label_len = slot_chars[i];
+        }
+
+        memset(labels[i], ' ', slot_chars[i]);
+        left_padding = ((size_t)slot_chars[i] - label_len) / 2U;
+        memcpy(&labels[i][left_padding], decorated, label_len);
+        labels[i][slot_chars[i]] = '\0';
+
+        color = selected ? ILI9488_COLOR_YELLOW : ILI9488_COLOR_WHITE;
 
         if ((((MenuOption_t)i == MENU_VACIAR) &&
              (g_jog_actual == JOG_AVANZANDO)) ||
@@ -1090,31 +1608,8 @@ static void SM_UpdateMenuDisplay(void)
             color = ILI9488_COLOR_GREEN;
         }
 
-        text_width = (uint16_t)strlen(labels[i]) * 12U;
-        text_x = (uint16_t)(slot_x[i] +
-                 ((slot_w[i] - text_width) / 2U));
-
-        label_changed = (!g_draw_menu[i].valid ||
-                         (strcmp(g_draw_menu[i].text, labels[i]) != 0))
-                            ? 1U : 0U;
-
-        if (g_draw_menu[i].valid && label_changed)
-        {
-            ILI9488_FillRect(slot_x[i], 282U, slot_w[i], 28U,
-                             ILI9488_COLOR_BLACK);
-        }
-
-        if (label_changed || (g_draw_menu[i].color != color))
-        {
-            ILI9488_DrawString(text_x, 288U, labels[i], color,
-                               ILI9488_COLOR_BLACK, 2U);
-
-            strncpy(g_draw_menu[i].text, labels[i],
-                    sizeof(g_draw_menu[i].text) - 1U);
-            g_draw_menu[i].text[sizeof(g_draw_menu[i].text) - 1U] = '\0';
-            g_draw_menu[i].color = color;
-            g_draw_menu[i].valid = 1U;
-        }
+        SM_DrawCachedText(slot_x[i], 288U, labels[i], color, 2U,
+                          &g_draw_menu[i]);
     }
 }
 
@@ -1147,13 +1642,23 @@ static void SM_UpdateDashboardBattery(uint8_t batt)
 
     if (batt <= 100U)
     {
-        snprintf(batt_text, sizeof(batt_text), "BAT %u%%", (unsigned)batt);
-        if (batt <= 20U)
+        if (g_batt_low_warning)
+        {
+            /* Ocho caracteres exactos: conserva el porcentaje y convierte el
+             * indicador en un aviso inequívoco sin abrir una pantalla modal. */
+            snprintf(batt_text, sizeof(batt_text), "BAJA %2u%%",
+                     (unsigned)batt);
             batt_color = ILI9488_COLOR_RED;
-        else if (batt <= 50U)
-            batt_color = ILI9488_COLOR_YELLOW;
+        }
         else
-            batt_color = ILI9488_COLOR_GREEN;
+        {
+            snprintf(batt_text, sizeof(batt_text), "BAT %u%%",
+                     (unsigned)batt);
+            if (batt <= 50U)
+                batt_color = ILI9488_COLOR_YELLOW;
+            else
+                batt_color = ILI9488_COLOR_GREEN;
+        }
     }
     else
     {
@@ -1179,15 +1684,23 @@ static void SM_DrawDashboardBody(void)
 
     if (g_menu_post_sample && g_sample_available)
     {
-        ILI9488_DrawString(138U, 62U, "Muestra realizada",
-            ILI9488_COLOR_GREEN, ILI9488_COLOR_BLACK, 2);
+        SM_DrawCenteredString(62U,
+            g_muestreo_por_timeout ? "Muestreo por tiempo"
+                                    : "Muestra realizada",
+            g_muestreo_por_timeout ? ILI9488_COLOR_YELLOW
+                                    : ILI9488_COLOR_GREEN,
+            ILI9488_COLOR_BLACK, 2U);
 
         ILI9488_DrawString(180U, 98U, g_sample_date,
                            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
         ILI9488_DrawString(210U, 128U, g_sample_time,
                            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
-        ILI9488_DrawString(90U, 172U, "Condiciones de la muestra",
-                           ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 2);
+        SM_DrawCenteredString(172U,
+            g_muestreo_por_timeout ? "Final de carrera no detectado"
+                                    : "Condiciones de la muestra",
+            g_muestreo_por_timeout ? ILI9488_COLOR_RED
+                                    : ILI9488_COLOR_YELLOW,
+            ILI9488_COLOR_BLACK, 2U);
 
         ILI9488_DrawString(SAMPLE_LABEL_X, 218U, "Profundidad",
                            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
@@ -1218,7 +1731,7 @@ static void SM_DrawDashboard(uint8_t batt)
     /* Esta función se usa sólo al entrar por primera vez al tablero o después
      * de una limpieza completa. Las transiciones internas usan actualizaciones
      * parciales y no vuelven a transmitir el encabezado. */
-    ILI9488_DrawString(4U, 18U, "SISTEMA OPERANDO",
+    ILI9488_DrawString(4U, 18U, "Sistema operando",
                        ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2U);
     SM_UpdateDashboardClock();
     SM_UpdateDashboardBattery(batt);
@@ -1369,8 +1882,9 @@ static void SM_ClearPreviousScreenContent(void)
 
     if (g_screen_last_state == STATE_INICIO)
     {
-        /* STATE_INICIO es el único cuyo título está en Y=60. */
-        ILI9488_FillRect(18U, 60U, 216U, 21U, ILI9488_COLOR_BLACK);
+        /* Campo centrado utilizado por la animacion de inicio. */
+        SM_DrawCenteredField(149U, "", ILI9488_COLOR_WHITE,
+                             ILI9488_COLOR_BLACK, 3U, 16U);
         return;
     }
 
@@ -1437,6 +1951,11 @@ static void SM_DrawScreen(void)
     uint8_t batt = SM_BatteryPercent();
     uint8_t current_dashboard  = SM_IsDashboardState(g_estado);
     uint8_t previous_dashboard = SM_IsDashboardState(g_screen_last_state);
+    uint8_t current_emergency  = SM_IsEmergencyState(g_estado);
+    uint8_t previous_emergency = SM_IsEmergencyState(g_screen_last_state);
+    uint8_t emergency_state_changed =
+        (current_emergency && previous_emergency &&
+         (g_estado != g_screen_last_state)) ? 1U : 0U;
     uint8_t current_sample_layout =
         (g_menu_post_sample && g_sample_available) ? 1U : 0U;
     uint8_t layout_changed =
@@ -1446,14 +1965,25 @@ static void SM_DrawScreen(void)
         (!g_screen_initialized ||
          (g_estado == STATE_ERROR_CONEXION) ||
          (g_screen_last_state == STATE_ERROR_CONEXION) ||
+         (current_emergency != previous_emergency) ||
          (current_dashboard != previous_dashboard)) ? 1U : 0U;
 
-    /* La pantalla completa sólo se limpia al entrar o salir del tablero. Un
-     * cambio entre la vista normal y "Muestra realizada" borra únicamente
-     * los textos de la distribución anterior. */
+    /* ESTABLECER_CONEXION conserva toda su lógica PING/ACK, pero ya no tiene
+     * una pantalla propia. Se mantiene visible "Iniciando..." hasta recibir
+     * ACK o hasta que el timeout lleve a la pantalla de error. No actualizar
+     * g_screen_last_state permite limpiar correctamente esa vista después. */
+    if (g_estado == STATE_ESTABLECER_CONEXION)
+    {
+        return;
+    }
+
+    /* La pantalla completa sólo se limpia cuando cambia el fondo general:
+     * al entrar/salir del tablero, del error de conexión o de la secuencia de
+     * emergencia. Sus estados internos actualizan únicamente texto. */
     if (full_redraw)
     {
-        ILI9488_FillScreen((g_estado == STATE_ERROR_CONEXION)
+        ILI9488_FillScreen(((g_estado == STATE_ERROR_CONEXION) ||
+                            current_emergency)
                           ? ILI9488_COLOR_RED : ILI9488_COLOR_BLACK);
 
         if (current_dashboard)
@@ -1466,7 +1996,11 @@ static void SM_DrawScreen(void)
         SM_ClearDashboardLayout(g_screen_last_sample_layout);
         SM_InvalidateDashboardBodyCache();
     }
-    else if (!current_dashboard)
+    else if (emergency_state_changed)
+    {
+        SM_ClearEmergencyScreenContent();
+    }
+    else if (!current_dashboard && !current_emergency)
     {
         SM_ClearPreviousScreenContent();
     }
@@ -1517,18 +2051,28 @@ static void SM_DrawScreen(void)
     }
 
     /* ---- Barra de estado superior: nivel de batería ---- */
-    if ((g_estado != STATE_ERROR_CONEXION) && !current_dashboard)
+    if ((g_estado != STATE_ERROR_CONEXION) &&
+        !SM_IsEmergencyState(g_estado) && !current_dashboard)
     {
         if (batt <= 100U)
         {
-            snprintf(buf, sizeof(buf), "Bat: %3d%%", (int)batt);
+            if (g_batt_low_warning)
+            {
+                snprintf(buf, sizeof(buf), "BAJA %2u%%", (unsigned)batt);
+            }
+            else
+            {
+                snprintf(buf, sizeof(buf), "BAT %3u%%", (unsigned)batt);
+            }
         }
         else
         {
-            snprintf(buf, sizeof(buf), "Bat:  --%%");
+            snprintf(buf, sizeof(buf), "BAT  --%%");
         }
-        ILI9488_DrawString(ILI9488_WIDTH - 130, 6,
-                           buf, ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
+        ILI9488_DrawString(372U, 6U, buf,
+                           g_batt_low_warning ? ILI9488_COLOR_RED
+                                              : ILI9488_COLOR_CYAN,
+                           ILI9488_COLOR_BLACK, 2U);
     }
 
     /* ---- Contenido según estado ---- */
@@ -1536,22 +2080,7 @@ static void SM_DrawScreen(void)
     {
     /* ------------------------------------------------------------------ */
     case STATE_INICIO:
-        ILI9488_DrawString(18, 60,
-            "Iniciando...",
-            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 3);
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case STATE_ESTABLECER_CONEXION:
-        ILI9488_DrawString(18, 40,
-            "Conectando",
-            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3);
-        ILI9488_DrawTextWrapped(18, 100, ILI9488_WIDTH - 36,
-            "Buscando modulo sumergido...",
-            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2);
-        ILI9488_DrawTextWrapped(18, 200, ILI9488_WIDTH - 36,
-            "Reintentando cada 1 s (max 20 s)",
-            ILI9488_COLOR_CYAN, ILI9488_COLOR_BLACK, 2);
+        SM_UpdateStartupAnimation(1U);
         break;
 
     /* ------------------------------------------------------------------ */
@@ -1565,6 +2094,76 @@ static void SM_DrawScreen(void)
         ILI9488_DrawTextWrapped(18, 200, ILI9488_WIDTH - 36,
             "Resetee el equipo para reintentar.",
             ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 2);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_EMERGENCIA:
+        SM_DrawCenteredString(35U, "PARADA DE EMERGENCIA",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_RED, 3U);
+        SM_DrawCenteredString(105U, "Motor detenido y valvula cerrada",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_RED, 2U);
+
+        if (g_emergency_error)
+        {
+            SM_DrawCenteredString(155U, "Recuperacion interrumpida",
+                ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 2U);
+        }
+        else if (g_muestreo_cancelado)
+        {
+            SM_DrawCenteredString(155U, "Muestreo cancelado: no guardado",
+                ILI9488_COLOR_WHITE, ILI9488_COLOR_RED, 2U);
+        }
+
+        if (!g_emergency_confirmed)
+        {
+            SM_DrawCenteredField(230U, "Esperando modulo sumergido...",
+                ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 2U, 32U);
+        }
+        else if (HAL_GPIO_ReadPin(BTN_4_PORT, BTN_4_PIN) == GPIO_PIN_SET)
+        {
+            SM_DrawCenteredField(230U, "Suelte Btn 4 (PD10)",
+                ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 2U, 32U);
+        }
+        else
+        {
+            SM_DrawCenteredField(230U, "[Iniciar recuperacion]",
+                ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 2U, 32U);
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_CONFIRMAR_RECUPERACION:
+        SM_DrawCenteredString(45U, "RECUPERACION",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 3U);
+        SM_DrawCenteredString(125U, "Iniciar recuperacion?",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_RED, 2U);
+        SM_DrawCenteredOptions(210U, ILI9488_COLOR_RED);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_RECUPERAR_FINAL:
+        SM_UpdateRecoveryAnimation(1U);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_CONFIRMAR_ARMADO:
+        SM_DrawCenteredString(45U, "CONFIRMAR ARMADO",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_RED, 3U);
+        SM_DrawCenteredString(125U, "Confirmar armado?",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_RED, 2U);
+        SM_DrawCenteredOptions(210U, ILI9488_COLOR_RED);
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case STATE_AVISO_ARMADO_TIMEOUT:
+        SM_DrawCenteredString(45U, "ARMADO INCOMPLETO",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 3U);
+        SM_DrawCenteredString(120U, "Tiempo maximo alcanzado",
+            ILI9488_COLOR_WHITE, ILI9488_COLOR_BLACK, 2U);
+        SM_DrawCenteredString(160U, "Final inicial no detectado",
+            ILI9488_COLOR_RED, ILI9488_COLOR_BLACK, 2U);
+        SM_DrawCenteredString(230U, "[Continuar]",
+            ILI9488_COLOR_YELLOW, ILI9488_COLOR_BLACK, 2U);
         break;
 
     default:
@@ -1583,7 +2182,16 @@ static void SM_DrawScreen(void)
  * -------------------------------------------------------------------------- */
 static void SM_SetState(SystemState_t nuevo)
 {
-    if (nuevo == STATE_MUESTREO_COMPLETO)
+    /* Segunda lectura justo antes del unico punto que escribe la muestra. Asi,
+     * una pulsacion ocurrida despues del inicio del tick tampoco llega a SD. */
+    if ((nuevo == STATE_MUESTREO_COMPLETO) &&
+        (HAL_GPIO_ReadPin(BTN_4_PORT, BTN_4_PIN) == GPIO_PIN_SET))
+    {
+        SM_ActivateEmergency(0U);
+        return;
+    }
+
+    if ((nuevo == STATE_MUESTREO_COMPLETO) && !g_muestreo_cancelado)
     {
         /* Registrar antes de dibujar para que fecha y hora aparezcan en la
          * primera presentacion de la pantalla "Muestra realizada". */
@@ -1624,10 +2232,30 @@ static void SM_SetState(SystemState_t nuevo)
     }
     else if (nuevo == STATE_ARMADO)
     {
+        if (g_estado != STATE_CONFIRMAR_ARMADO)
+        {
+            g_armado_recuperacion = 0U;
+        }
+
         /* Abandonar definitivamente la pantalla de la muestra anterior. */
         g_menu_post_sample = 0U;
         g_menu_selected    = MENU_PRINCIPAL;
         g_sample_available = 0U;
+    }
+    else if (nuevo == STATE_RECUPERAR_FINAL)
+    {
+        g_recovery_step  = RECOVERY_RESET_EMERGENCY;
+        g_ts_recovery    = HAL_GetTick();
+        g_ts_recovery_animation = g_ts_recovery;
+        g_recovery_animation_frame = 0U;
+        g_esperando_rsp  = 0U;
+    }
+
+    if ((nuevo == STATE_CONFIRMAR_RECUPERACION) ||
+        (nuevo == STATE_CONFIRMAR_ARMADO))
+    {
+        /* La opcion segura es siempre la predeterminada. */
+        g_confirm_yes = 0U;
     }
 
     g_estado        = nuevo;
@@ -1653,6 +2281,8 @@ static void SM_SetState(SystemState_t nuevo)
         g_jog_actual          = JOG_NONE;
         g_jog_bloqueado       = 0U;
         g_valvula_abierta     = 1U;
+        g_muestreo_cancelado  = 0U;
+        g_muestreo_por_timeout = 0U;
     }
     else
     {
@@ -1680,6 +2310,17 @@ static void SM_Run(void)
 {
     uint32_t ahora    = HAL_GetTick();
     uint8_t  hay_linea = 0U;
+    uint8_t  emergency_now =
+        (HAL_GPIO_ReadPin(BTN_4_PORT, BTN_4_PIN) == GPIO_PIN_SET) ? 1U : 0U;
+
+    /* PD10 tiene prioridad sobre UART, menus y cualquier maquina en curso.
+     * No se aplica demora de antirrebote: el primer nivel alto queda enclavado. */
+    if (emergency_now &&
+        ((!g_emergency_latched) || (g_estado != STATE_EMERGENCIA)))
+    {
+        SM_ActivateEmergency(0U);
+        ahora = HAL_GetTick();
+    }
 
     /* ---- Capturar línea UART si está disponible ---- */
     if (UARTUTILS_LineAvailable())
@@ -1690,6 +2331,8 @@ static void SM_Run(void)
             /* ¿Es un dato del sensor? Parsearlo y actualizar pantalla */
             if (SM_ParseSensor(g_uart_line))
             {
+                SM_RegisterModuleResponse(ahora);
+
                 if (SM_IsDashboardState(g_estado) &&
                     (!g_menu_post_sample || !g_sample_available))
                 {
@@ -1702,8 +2345,44 @@ static void SM_Run(void)
                 strncpy(g_uart_rx, g_uart_line, sizeof(g_uart_rx) - 1U);
                 g_uart_rx[sizeof(g_uart_rx) - 1U] = '\0';
                 hay_linea = 1U;
+
+                if (SM_IsModuleResponse(g_uart_rx))
+                {
+                    SM_RegisterModuleResponse(ahora);
+                }
             }
         }
+    }
+
+    /* Dos finales activos a la vez se consideran una falla de seguridad en
+     * cualquier estado: detener y exigir nuevamente toda la recuperacion. */
+    if (hay_linea &&
+        (SM_CheckResponse(RSP_FINALES_INCOMPATIBLES) ||
+         SM_CheckResponse(RSP_ARMADO_FINALES)) &&
+        !SM_IsEmergencyState(g_estado))
+    {
+        SM_ActivateEmergency(1U);
+        return;
+    }
+
+    /* Si el sumergido informa que ya esta enclavado, adoptar ese estado aun
+     * cuando la parada no se haya originado en este ciclo de la superficie. */
+    if (hay_linea && SM_CheckResponse(RSP_EMERGENCIA_ACTIVA) &&
+        (g_estado != STATE_EMERGENCIA) &&
+        (g_estado != STATE_ERROR_CONEXION))
+    {
+        SM_ActivateEmergency(0U);
+        g_emergency_confirmed = 1U;
+        SM_DrawScreen();
+        return;
+    }
+
+    /* Una desconexion no puede dejar indefinidamente "Comunicacion OK". La
+     * parada por PD10 y los errores de seguridad anteriores conservan siempre
+     * mayor prioridad que este supervisor. */
+    if (SM_ServiceConnectionWatchdog(ahora))
+    {
+        return;
     }
 
     /* En las pantallas de operacion, una respuesta STATUS actualiza la opcion
@@ -1732,8 +2411,8 @@ static void SM_Run(void)
     /* ================================================================== */
     case STATE_INICIO:
     /*
-     * Inicializa timestamps y transiciona inmediatamente.
-     * La pantalla "Iniciando..." se muestra sólo un instante.
+     * Inicializa timestamps y comienza la comprobacion de enlace. La pantalla
+     * "Iniciando..." permanece visible durante todo el intercambio PING/ACK.
      */
         g_ts_conexion   = ahora;
         g_ts_ping       = 0U;
@@ -1745,10 +2424,13 @@ static void SM_Run(void)
     /* ================================================================== */
     case STATE_ESTABLECER_CONEXION:
     /*
+     * Estado sin pantalla propia: conserva visible "Iniciando...".
      * Envía PING cada INTERVALO_PING_MS.
      * Si recibe ACK → COMPROBACION_SISTEMA.
      * Si pasan TIMEOUT_CONEXION_MS sin ACK → ERROR_CONEXION.
      */
+        SM_UpdateStartupAnimation(0U);
+
         /* ¿Tiempo agotado? */
         if ((ahora - g_ts_conexion) >= TIMEOUT_CONEXION_MS)
         {
@@ -1842,8 +2524,9 @@ static void SM_Run(void)
     case STATE_INICIAR_MUESTREO:
     /*
      * Envía CMD:MUESTREO al sumergido.
-     * Espera MUESTREO_DONE (puede llegar después de MUESTREO_OK).
-     * Si pasan TIMEOUT_MUESTREO_MS sin DONE → vuelve a COMPROBACION.
+     * Espera MUESTREO_DONE o MUESTREO_ERROR:TIMEOUT (pueden llegar después
+     * de MUESTREO_OK). En ambos casos conserva los datos, pero el segundo se
+     * identifica en pantalla como una muestra terminada sin PB1.
      */
         if (!g_esperando_rsp)
         {
@@ -1863,8 +2546,13 @@ static void SM_Run(void)
 
         if (hay_linea)
         {
-            if (SM_CheckResponse(RSP_MUESTREO_DONE))
+            if ((SM_CheckResponse(RSP_MUESTREO_DONE) ||
+                 SM_CheckResponse(RSP_MUESTREO_TIMEOUT)) &&
+                !g_muestreo_cancelado)
             {
+                g_muestreo_por_timeout =
+                    SM_CheckResponse(RSP_MUESTREO_TIMEOUT);
+
                 /* Congelar las condiciones asociadas a esta muestra. Las
                  * telemetrias posteriores no modificaran estos valores. */
                 strncpy(g_sample_temp, g_sensor_temp,
@@ -2060,10 +2748,159 @@ static void SM_Run(void)
         break;
 
     /* ================================================================== */
+    case STATE_EMERGENCIA:
+    /*
+     * Estado enclavado. Se retransmite la parada hasta recibir confirmacion.
+     * Soltar PD10 no provoca movimiento: solo habilita el acceso al primer
+     * cuadro de confirmacion mediante Btn 1.
+     */
+        if (hay_linea && SM_CheckResponse(RSP_EMERGENCIA_ACTIVA))
+        {
+            if (!g_emergency_confirmed)
+            {
+                g_emergency_confirmed = 1U;
+                SM_DrawScreen();
+            }
+            g_uart_rx[0] = '\0';
+        }
+
+        if (g_emergency_confirmed && (g_btn4_prev != emergency_now))
+        {
+            g_btn4_prev = emergency_now;
+            SM_DrawScreen();
+        }
+        else
+        {
+            g_btn4_prev = emergency_now;
+        }
+
+        if (!g_emergency_confirmed &&
+            ((ahora - g_ts_emergency_tx) >= INTERVALO_EMERGENCIA_MS))
+        {
+            SM_SendCmd(CMD_EMERGENCIA);
+            g_ts_emergency_tx = ahora;
+        }
+
+        if (g_emergency_confirmed && !emergency_now)
+        {
+            if (SM_ButtonEdge(BTN_SELECT_PORT, BTN_SELECT_PIN,
+                              &g_btn_select_prev))
+            {
+                SM_SetState(STATE_CONFIRMAR_RECUPERACION);
+
+                /* El mismo pulso que abre el cuadro no puede confirmarlo. */
+                g_btn_select_prev = 1U;
+            }
+        }
+        else
+        {
+            /* Si Btn 1 ya estaba pulsado antes de estar en condicion segura,
+             * exigir que se suelte y se vuelva a pulsar. */
+            g_btn_select_prev =
+                SM_ButtonPressed(BTN_SELECT_PORT, BTN_SELECT_PIN);
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_CONFIRMAR_RECUPERACION:
+        SM_HandleSafetyConfirmation(0U);
+        break;
+
+    /* ================================================================== */
+    case STATE_RECUPERAR_FINAL:
+    /*
+     * Dos intercambios previos al movimiento:
+     *   1) liberar la parada para una recuperacion controlada;
+     *   2) ordenar el desplazamiento exclusivo a posicion final.
+     * El comando de muestreo no se reutiliza, por lo que nunca puede producir
+     * MUESTREO_DONE ni activar el registro en la microSD.
+     */
+        SM_UpdateRecoveryAnimation(0U);
+
+        if (hay_linea && SM_CheckResponse(RSP_RECUPERACION_ERROR))
+        {
+            SM_ActivateEmergency(1U);
+            break;
+        }
+
+        if (hay_linea && SM_CheckResponse(RSP_RECUPERACION_FINAL_OK))
+        {
+            g_confirm_yes = 0U;
+            SM_SetState(STATE_CONFIRMAR_ARMADO);
+            break;
+        }
+
+        if (hay_linea &&
+            (g_recovery_step == RECOVERY_RESET_EMERGENCY) &&
+            SM_CheckResponse(RSP_EMERGENCIA_LIBERADA))
+        {
+            g_recovery_step  = RECOVERY_START_FINAL;
+            g_esperando_rsp  = 0U;
+            g_ts_recovery    = ahora;
+            g_uart_rx[0]     = '\0';
+        }
+        else if (hay_linea &&
+                 (g_recovery_step != RECOVERY_RESET_EMERGENCY) &&
+                 SM_CheckResponse(RSP_RECUPERACION_INICIADA))
+        {
+            g_recovery_step = RECOVERY_WAIT_FINAL;
+            g_ts_recovery   = ahora;
+            g_uart_rx[0]    = '\0';
+        }
+        else if (hay_linea)
+        {
+            g_uart_rx[0] = '\0';
+        }
+
+        if (g_recovery_step == RECOVERY_RESET_EMERGENCY)
+        {
+            if ((ahora - g_ts_recovery) >= TIMEOUT_RECOVERY_LINK_MS)
+            {
+                SM_ActivateEmergency(1U);
+                break;
+            }
+
+            if (!g_esperando_rsp ||
+                ((ahora - g_ts_respuesta) >= INTERVALO_RECOVERY_CMD_MS))
+            {
+                SM_SendCmd(CMD_RESET_EMERGENCIA);
+                g_ts_respuesta  = ahora;
+                g_esperando_rsp = 1U;
+            }
+        }
+        else if (g_recovery_step == RECOVERY_START_FINAL)
+        {
+            if ((ahora - g_ts_recovery) >= TIMEOUT_RECOVERY_LINK_MS)
+            {
+                SM_ActivateEmergency(1U);
+                break;
+            }
+
+            if (!g_esperando_rsp ||
+                ((ahora - g_ts_respuesta) >= INTERVALO_RECOVERY_CMD_MS))
+            {
+                SM_SendCmd(CMD_RECUPERAR_FINAL);
+                g_ts_respuesta  = ahora;
+                g_esperando_rsp = 1U;
+            }
+        }
+        else if ((ahora - g_ts_recovery) >= TIMEOUT_RECOVERY_MOVE_MS)
+        {
+            SM_ActivateEmergency(1U);
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_CONFIRMAR_ARMADO:
+        SM_HandleSafetyConfirmation(1U);
+        break;
+
+    /* ================================================================== */
     case STATE_ARMADO:
     /*
      * Envia CMD:ARMAR.
-     * ARMADO_OK o ARMADO_ERROR:TIMEOUT -> COMPROBACION_SISTEMA.
+     * ARMADO_OK -> COMPROBACION_SISTEMA.
+     * ARMADO_ERROR:TIMEOUT -> aviso persistente antes de comprobar estado.
      */
         if (!g_esperando_rsp)
         {
@@ -2077,10 +2914,43 @@ static void SM_Run(void)
          * tambien vence TIMEOUT_RESPUESTA_MS. */
         if (hay_linea)
         {
-            if (SM_CheckResponse(RSP_ARMADO_OK) ||
-                SM_CheckResponse(RSP_ARMADO_TIMEOUT))
+            if (SM_CheckResponse(RSP_ARMADO_OK))
             {
+                if (g_armado_recuperacion)
+                {
+                    g_emergency_latched   = 0U;
+                    g_emergency_confirmed = 0U;
+                    g_emergency_error     = 0U;
+                    g_muestreo_cancelado  = 0U;
+                    g_armado_recuperacion = 0U;
+                }
                 SM_SetState(STATE_COMPROBACION_SISTEMA);
+                break;
+            }
+            else if (SM_CheckResponse(RSP_ARMADO_TIMEOUT))
+            {
+                if (g_armado_recuperacion)
+                {
+                    /* En una recuperacion no se permite continuar si PB0 no
+                     * confirmo que el sistema quedo realmente armado. */
+                    SM_ActivateEmergency(1U);
+                }
+                else
+                {
+                    SM_SetState(STATE_AVISO_ARMADO_TIMEOUT);
+                }
+                break;
+            }
+            else if (SM_CheckResponse(RSP_ARMADO_ERROR))
+            {
+                if (g_armado_recuperacion)
+                {
+                    SM_ActivateEmergency(1U);
+                }
+                else
+                {
+                    SM_SetState(STATE_COMPROBACION_SISTEMA);
+                }
                 break;
             }
 
@@ -2088,11 +2958,33 @@ static void SM_Run(void)
         }
 
         /* No reenviar CMD:ARMAR cada 3 s: el recorrido sumergido admite hasta
-         * 35 s. Si tampoco llega su respuesta, comprobar igualmente estado. */
+         * 35 s. Si no llega su respuesta terminal, advertir antes de volver a
+         * consultar el estado; nunca afirmar que el sistema quedo armado. */
         if ((ahora - g_ts_respuesta) >= TIMEOUT_ARMADO_MS)
         {
-            SM_SetState(STATE_COMPROBACION_SISTEMA);
+            if (g_armado_recuperacion)
+            {
+                SM_ActivateEmergency(1U);
+            }
+            else
+            {
+                SM_SetState(STATE_AVISO_ARMADO_TIMEOUT);
+            }
             break;
+        }
+        break;
+
+    /* ================================================================== */
+    case STATE_AVISO_ARMADO_TIMEOUT:
+        /* El aviso permanece hasta que el operador lo reconoce con Btn 1.
+         * Se concede una ventana nueva al supervisor de enlace para que la
+         * comprobacion STATUS pueda ejecutarse antes de evaluar silencio. */
+        if (SM_ButtonEdge(BTN_SELECT_PORT, BTN_SELECT_PIN,
+                          &g_btn_select_prev))
+        {
+            g_ts_last_comm_rx = ahora;
+            g_link_warning = 0U;
+            SM_SetState(STATE_COMPROBACION_SISTEMA);
         }
         break;
 
@@ -2543,6 +3435,13 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* PD10 es activo alto. El pull-down evita una parada falsa si el contacto
+   * queda abierto y no existe una resistencia externa en la placa. */
+  GPIO_InitStruct.Pin = BTN_4_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(BTN_4_PORT, &GPIO_InitStruct);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
